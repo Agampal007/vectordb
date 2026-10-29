@@ -1,0 +1,16 @@
+.gradle/
+build/
+out/
+*.class
+
+# IDEs
+.idea/
+*.iml
+.vscode/
+.classpath
+.project
+.settings/
+bin/
+
+# Benchmark datasets are downloaded, not committed
+data/
