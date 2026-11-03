@@ -28,6 +28,20 @@ tasks.register<JavaExec>("sweep") {
     mainClass = "io.github.agampal007.vectordb.RandomDataSweep"
 }
 
+tasks.register<JavaExec>("sift") {
+    description = "HNSW against exact search on SIFT-1M (run scripts/download_sift.sh first)."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.SiftBenchmark"
+    maxHeapSize = "8g"
+    args = listOf(
+        "data/sift",
+        (findProperty("n") ?: "1000000").toString(),
+        (findProperty("m") ?: "16").toString(),
+        (findProperty("efConstruction") ?: "200").toString(),
+    )
+}
+
 tasks.test {
     useJUnitPlatform()
     testLogging {

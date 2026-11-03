@@ -1,0 +1,25 @@
+built 100,000 / 1,000,000 (40 s)
+built 200,000 / 1,000,000 (102 s)
+built 300,000 / 1,000,000 (175 s)
+built 400,000 / 1,000,000 (251 s)
+built 500,000 / 1,000,000 (326 s)
+built 600,000 / 1,000,000 (408 s)
+built 700,000 / 1,000,000 (486 s)
+built 800,000 / 1,000,000 (569 s)
+built 900,000 / 1,000,000 (655 s)
+built 1,000,000 / 1,000,000 (742 s)
+SIFT: 1,000,000 base vectors, 10,000 queries, 128 dimensions, L2, k = 10
+HNSW M = 16, efConstruction = 200: built in 742 s; heap in use with both indexes: 1.52 GB
+
+| Index | efSearch | Recall@10 | Queries/s | p50 latency (ms) | p99 latency (ms) |
+| --- | --- | --- | --- | --- | --- |
+| Exact (FlatIndex) | - | 1.000 | 16 | 56.876 | 94.356 |
+| HNSW | 10 | 0.709 | 12,254 | 0.076 | 0.179 |
+| HNSW | 20 | 0.839 | 8,232 | 0.116 | 0.226 |
+| HNSW | 40 | 0.928 | 4,681 | 0.207 | 0.422 |
+| HNSW | 80 | 0.975 | 2,697 | 0.363 | 0.644 |
+| HNSW | 160 | 0.993 | 1,473 | 0.671 | 1.210 |
+| HNSW | 320 | 0.998 | 806 | 1.235 | 2.194 |
+| HNSW | 640 | 0.999 | 426 | 2.302 | 4.397 |
+
+Exact search timed on the first 200 queries.
