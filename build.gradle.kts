@@ -21,6 +21,13 @@ tasks.withType<JavaCompile>().configureEach {
     options.compilerArgs.addAll(listOf("-Xlint:all", "-Werror"))
 }
 
+tasks.register<JavaExec>("sweep") {
+    description = "Recall and speed of HNSW against exact search on random vectors."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.RandomDataSweep"
+}
+
 tasks.test {
     useJUnitPlatform()
     testLogging {

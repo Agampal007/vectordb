@@ -42,6 +42,17 @@ class DistanceTest {
     }
 
     @Test
+    void twoOffsetsCompareRowsOfTheSameArray() {
+        float[] packed = {0, 0, 3, 4};
+        for (Distance d : Distance.values()) {
+            assertEquals(
+                    d.between(new float[] {0, 0}, new float[] {3, 4}),
+                    d.compute(packed, 0, packed, 2, 2),
+                    EPS);
+        }
+    }
+
+    @Test
     void rejectsDimensionMismatch() {
         for (Distance d : Distance.values()) {
             assertThrows(IllegalArgumentException.class, () -> d.between(new float[2], new float[3]));
