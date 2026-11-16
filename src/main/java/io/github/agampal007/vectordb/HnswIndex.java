@@ -8,7 +8,6 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.Random;
 
 /**
  * Approximate nearest-neighbour index using a Hierarchical Navigable Small World graph.
@@ -71,7 +70,7 @@ public final class HnswIndex implements VectorIndex {
     private int efSearch;
     /** {@code mL = 1 / ln(M)}, the level normaliser from the paper. */
     private final double levelMultiplier;
-    private final Random random;
+    private final Lcg random;
 
     private final List<Node> nodes = new ArrayList<>();
     private final Map<Long, Integer> nodeById = new HashMap<>();
@@ -117,7 +116,7 @@ public final class HnswIndex implements VectorIndex {
         this.efConstruction = efConstruction;
         this.efSearch = efSearch;
         this.levelMultiplier = 1.0 / Math.log(maxConnections);
-        this.random = new Random(seed);
+        this.random = new Lcg(seed);
         this.data = new float[INITIAL_CAPACITY * dimension];
     }
 
