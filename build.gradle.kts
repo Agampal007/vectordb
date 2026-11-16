@@ -1,5 +1,6 @@
 plugins {
     `java-library`
+    application
 }
 
 group = "io.github.agampal007"
@@ -7,6 +8,12 @@ version = "0.1.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
+}
+
+// ./gradlew run --args="--port 8080 --data vectordb-data" starts the server; installDist builds
+// build/install/vectordb with a start script, which the Dockerfile uses.
+application {
+    mainClass = "io.github.agampal007.vectordb.server.Main"
 }
 
 dependencies {
