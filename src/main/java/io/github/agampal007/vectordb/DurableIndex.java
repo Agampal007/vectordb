@@ -38,7 +38,8 @@ public final class DurableIndex implements VectorIndex, Closeable {
             long snapshotSequence,
             long replayedEntries,
             long skippedEntries,
-            long truncatedBytes) {}
+            long truncatedBytes,
+            boolean unfinishedSnapshotDiscarded) {}
 
     static final String SNAPSHOT_FILE = "snapshot.bin";
     static final String SNAPSHOT_TEMPORARY = "snapshot.tmp";
@@ -69,7 +70,7 @@ public final class DurableIndex implements VectorIndex, Closeable {
             throws IOException {
         Files.createDirectories(directory);
         // A snapshot that was still being written when the process died was never renamed into place.
-        Files.deleteIfExists(directory.resolve(SNAPSHOT_TEMPORARY));
+        boolean unfinishedSnapshot = Files.deleteIfExists(directory.resolve(SNAPSHOT_TEMPORARY));
 
         Path snapshotPath = directory.resolve(SNAPSHOT_FILE);
         boolean snapshotLoaded = Files.exists(snapshotPath);
@@ -99,8 +100,8 @@ public final class DurableIndex implements VectorIndex, Closeable {
         } catch (IllegalArgumentException | IllegalStateException e) {
             throw new IOException(directory + ": the log does not match the index it is replayed into", e);
         }
-        Recovery recovery =
-                new Recovery(snapshotLoaded, snapshotSequence, replayed[0], skipped[0], log.truncatedBytes());
+        Recovery recovery = new Recovery(
+                snapshotLoaded, snapshotSequence, replayed[0], skipped[0], log.truncatedBytes(), unfinishedSnapshot);
         return new DurableIndex(directory, index, log, recovery);
     }
 

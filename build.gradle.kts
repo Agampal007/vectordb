@@ -42,8 +42,19 @@ tasks.register<JavaExec>("sift") {
     )
 }
 
+tasks.register<JavaExec>("durability") {
+    description = "Cost of logging and speed of recovery on SIFT vectors (run scripts/download_sift.sh first)."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.DurabilityBenchmark"
+    maxHeapSize = "4g"
+    args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
+}
+
 tasks.test {
     useJUnitPlatform()
+    // KillRecoveryTest starts a second JVM with the same classes.
+    systemProperty("vectordb.test.classpath", classpath.asPath)
     testLogging {
         events("failed", "skipped")
         exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL

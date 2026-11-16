@@ -34,24 +34,6 @@ class DurableIndexTest {
         }
     }
 
-    /** Same nodes, levels, links and tombstones: the two indexes are the same graph. */
-    private static void assertSameGraph(HnswIndex expected, HnswIndex actual) {
-        assertEquals(expected.nodeCount(), actual.nodeCount());
-        assertEquals(expected.size(), actual.size());
-        for (int node = 0; node < expected.nodeCount(); node++) {
-            assertEquals(expected.levelOf(node), actual.levelOf(node), "level of node " + node);
-            for (int layer = 0; layer <= expected.levelOf(node); layer++) {
-                assertArrayEquals(
-                        expected.neighboursOf(node, layer),
-                        actual.neighboursOf(node, layer),
-                        "links of node " + node + " on layer " + layer);
-            }
-        }
-        for (float[] query : RandomVectors.generate(20, DIM, 78L)) {
-            assertEquals(expected.search(query, 10), actual.search(query, 10));
-        }
-    }
-
     @Test
     void writesSurviveAReopen() throws IOException {
         try (DurableIndex index = open()) {
@@ -60,7 +42,7 @@ class DurableIndexTest {
             assertFalse(index.remove(17));
         }
         try (DurableIndex index = open()) {
-            assertEquals(new DurableIndex.Recovery(false, 0, 201, 0, 0), index.recovery());
+            assertEquals(new DurableIndex.Recovery(false, 0, 201, 0, 0, false), index.recovery());
             assertEquals(199, index.size());
             assertFalse(index.contains(17));
             assertArrayEquals(VECTORS[42], index.get(42));
@@ -95,7 +77,7 @@ class DurableIndexTest {
             }
         }
         try (DurableIndex index = open()) {
-            assertSameGraph(uninterrupted, index.index());
+            TestGraphs.assertSameGraph(uninterrupted, index.index());
         }
     }
 
@@ -108,7 +90,7 @@ class DurableIndexTest {
             index.snapshot();
         }
         try (DurableIndex index = open()) {
-            assertEquals(new DurableIndex.Recovery(true, 101, 0, 0, 0), index.recovery());
+            assertEquals(new DurableIndex.Recovery(true, 101, 0, 0, 0, false), index.recovery());
             assertEquals(99, index.size());
             assertFalse(index.contains(3));
             assertEquals(77, index.index().efSearch());
@@ -124,7 +106,7 @@ class DurableIndexTest {
             index.writeSnapshot(); // the process "dies" here, before the log is emptied
         }
         try (DurableIndex index = open()) {
-            assertEquals(new DurableIndex.Recovery(true, 100, 0, 100, 0), index.recovery());
+            assertEquals(new DurableIndex.Recovery(true, 100, 0, 100, 0, false), index.recovery());
             assertEquals(100, index.size());
             addRange(index, 100, 120);
         }
@@ -143,6 +125,7 @@ class DurableIndexTest {
         Files.write(temporary, new byte[] {1, 2, 3});
         try (DurableIndex index = open()) {
             assertEquals(50, index.size());
+            assertTrue(index.recovery().unfinishedSnapshotDiscarded());
             assertFalse(Files.exists(temporary));
         }
     }
