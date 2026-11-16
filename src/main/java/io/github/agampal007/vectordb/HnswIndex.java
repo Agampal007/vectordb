@@ -2,6 +2,7 @@ package io.github.agampal007.vectordb;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
@@ -22,8 +23,11 @@ import java.util.PriorityQueue;
  * beam search ({@code ef} candidates) on the bottom layer.
  *
  * <p>Neighbours are chosen with the paper's heuristic (Algorithm 4) without its optional
- * candidate extension or kept-pruned connections, which is also what hnswlib does. Not
- * thread-safe.
+ * candidate extension or kept-pruned connections, which is also what hnswlib does.
+ *
+ * <p>Removal is by tombstone: a removed node stays in the graph so that searches can still pass
+ * through it, but it is never returned. Its memory is not reclaimed, so an index with heavy churn
+ * should be rebuilt. Not thread-safe.
  */
 public final class HnswIndex implements VectorIndex {
 
@@ -73,7 +77,10 @@ public final class HnswIndex implements VectorIndex {
     private final Lcg random;
 
     private final List<Node> nodes = new ArrayList<>();
+    /** Live ids only: a removed node keeps its slot in {@link #nodes} but leaves this map. */
     private final Map<Long, Integer> nodeById = new HashMap<>();
+    /** Tombstones, by node index. */
+    private final BitSet removed = new BitSet();
     /** Vectors packed row-major, as in {@link FlatIndex}; row {@code i} belongs to node {@code i}. */
     private float[] data;
     private int entryPoint = -1;
@@ -132,7 +139,29 @@ public final class HnswIndex implements VectorIndex {
 
     @Override
     public int size() {
-        return nodes.size();
+        return nodeById.size();
+    }
+
+    @Override
+    public boolean contains(long id) {
+        return nodeById.containsKey(id);
+    }
+
+    @Override
+    public float[] get(long id) {
+        Integer node = nodeById.get(id);
+        return node == null ? null : Arrays.copyOfRange(data, node * dimension, (node + 1) * dimension);
+    }
+
+    /** Marks the node as removed. It stays linked into the graph but is never returned. */
+    @Override
+    public boolean remove(long id) {
+        Integer node = nodeById.remove(id);
+        if (node == null) {
+            return false;
+        }
+        removed.set(node);
+        return true;
     }
 
     public int efSearch() {
@@ -175,7 +204,7 @@ public final class HnswIndex implements VectorIndex {
         List<Candidate> entryPoints = List.of(nearest);
         Node inserted = nodes.get(node);
         for (int layer = Math.min(level, entryLevel); layer >= 0; layer--) {
-            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer);
+            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer, false);
             for (Candidate neighbour : selectNeighbours(found, maxConnections)) {
                 inserted.neighbours[layer][inserted.neighbourCount[layer]++] = neighbour.node();
                 link(neighbour.node(), node, neighbour.distance(), layer);
@@ -204,7 +233,7 @@ public final class HnswIndex implements VectorIndex {
         for (int layer = nodes.get(entryPoint).level(); layer > 0; layer--) {
             nearest = greedyClosest(query, nearest, layer);
         }
-        List<Candidate> found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0);
+        List<Candidate> found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0, true);
 
         int count = Math.min(k, found.size());
         List<SearchResult> results = new ArrayList<>(count);
@@ -220,25 +249,30 @@ public final class HnswIndex implements VectorIndex {
      * Beam search on one layer (Algorithm 2). Expands the closest unexpanded candidate until the
      * closest one left is further than the worst of the {@code ef} best found so far.
      *
+     * <p>With {@code liveOnly}, removed nodes are still expanded, because the path to a live
+     * neighbour may run through them, but they do not take a place among the results.
+     *
      * @return up to {@code ef} nodes, closest first
      */
     private List<Candidate> searchLayer(
-            float[] query, List<Candidate> entryPoints, int ef, int layer) {
+            float[] query, List<Candidate> entryPoints, int ef, int layer, boolean liveOnly) {
         int epoch = nextVisitEpoch();
         PriorityQueue<Candidate> toExpand = new PriorityQueue<>(CLOSEST_FIRST);
         PriorityQueue<Candidate> best = new PriorityQueue<>(CLOSEST_FIRST.reversed());
         for (Candidate entry : entryPoints) {
             visited[entry.node()] = epoch;
             toExpand.add(entry);
-            best.add(entry);
-            if (best.size() > ef) {
-                best.poll();
+            if (!liveOnly || !removed.get(entry.node())) {
+                best.add(entry);
+                if (best.size() > ef) {
+                    best.poll();
+                }
             }
         }
 
         while (!toExpand.isEmpty()) {
             Candidate current = toExpand.poll();
-            if (current.distance() > best.peek().distance()) {
+            if (best.size() >= ef && current.distance() > best.peek().distance()) {
                 break;
             }
             Node node = nodes.get(current.node());
@@ -253,9 +287,11 @@ public final class HnswIndex implements VectorIndex {
                 if (best.size() < ef || d < best.peek().distance()) {
                     Candidate candidate = new Candidate(next, d);
                     toExpand.add(candidate);
-                    best.add(candidate);
-                    if (best.size() > ef) {
-                        best.poll();
+                    if (!liveOnly || !removed.get(next)) {
+                        best.add(candidate);
+                        if (best.size() > ef) {
+                            best.poll();
+                        }
                     }
                 }
             }
