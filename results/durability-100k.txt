@@ -1,0 +1,11 @@
+SIFT, first 100,000 vectors, 128 dimensions, M = 16, efConstruction = 200
+
+| Step | Time | Notes |
+| --- | --- | --- |
+| Build in memory | 32.7 s | no durability |
+| Build with every write logged, one fsync at the end | 33.2 s | log is 51 MB |
+| Recover by replaying the log | 33.3 s | rebuilds the graph insert by insert |
+| Write a snapshot | 0.11 s | 58 MB, includes fsync |
+| Recover from the snapshot | 0.09 s | 368x faster than replay; results identical to the in-memory build: true |
+
+Log appends alone (2,000 records of 128 floats): 1,771 per second with an fsync per record, 257,526 per second without.
