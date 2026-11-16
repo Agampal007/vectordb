@@ -108,6 +108,10 @@ public final class CollectionStore implements Closeable {
                 Settings settings = readSettings(directory.resolve(SETTINGS_FILE));
                 DurableIndex index = DurableIndex.open(directory, settings::emptyIndex, SyncPolicy.MANUAL);
                 store.collections.put(name, new Collection(name, settings, index));
+                DurableIndex.Recovery recovery = index.recovery();
+                System.out.println("opened " + name + ": " + index.size() + " vectors, "
+                        + (recovery.snapshotLoaded() ? "snapshot loaded, " : "no snapshot, ")
+                        + recovery.replayedEntries() + " logged operations replayed");
             }
             return store;
         } catch (IOException | RuntimeException e) {

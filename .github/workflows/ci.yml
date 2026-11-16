@@ -20,3 +20,25 @@ jobs:
           java-version: ${{ matrix.java }}
       - uses: gradle/actions/setup-gradle@v4
       - run: ./gradlew build --no-daemon
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: docker build -t vectordb .
+      - name: Data survives a clean stop and a kill
+        run: |
+          docker run -d --name vectordb -p 8080:8080 -v vectordb-data:/data vectordb
+          scripts/smoke_test.sh load
+          docker stop vectordb    # SIGTERM: the server snapshots and exits
+          docker start vectordb
+          scripts/smoke_test.sh check http://localhost:8080 3
+          docker logs vectordb | grep "opened demo: 3 vectors, snapshot loaded, 0 logged operations replayed"
+          scripts/smoke_test.sh add
+          docker kill vectordb    # SIGKILL: no warning, so recovery has to replay the log
+          docker start vectordb
+          scripts/smoke_test.sh check http://localhost:8080 4
+          docker logs vectordb | grep "opened demo: 4 vectors, snapshot loaded, 2 logged operations replayed"
+      - name: Server log
+        if: always()
+        run: docker logs vectordb

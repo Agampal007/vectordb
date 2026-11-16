@@ -22,7 +22,7 @@ public final class Main {
 
     private Main() {}
 
-    public static void main(String[] args) throws IOException {
+    public static void main(String[] args) {
         Path data = Path.of("vectordb-data");
         String host = "127.0.0.1";
         int port = 8080;
@@ -54,8 +54,15 @@ public final class Main {
             return;
         }
 
-        VectorDbServer server =
-                VectorDbServer.start(data, host, port, new Options(sync, snapshotLogBytes, maxBodyBytes));
+        VectorDbServer server;
+        try {
+            server = VectorDbServer.start(data, host, port, new Options(sync, snapshotLogBytes, maxBodyBytes));
+        } catch (IOException e) {
+            // A locked directory, a corrupt log, a port in use: say which, without a stack trace.
+            System.err.println("vectordb: cannot start: " + e.getMessage());
+            System.exit(1);
+            return;
+        }
         // SIGTERM (docker stop, Ctrl-C) snapshots every collection so the next start is fast.
         Runtime.getRuntime().addShutdownHook(new Thread(() -> {
             try {
