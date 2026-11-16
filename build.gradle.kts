@@ -58,6 +58,15 @@ tasks.register<JavaExec>("durability") {
     args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
 }
 
+tasks.register<JavaExec>("concurrency") {
+    description = "Search throughput by thread count, with a writer, and over HTTP (run scripts/download_sift.sh first)."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.server.ConcurrencyBenchmark"
+    maxHeapSize = "4g"
+    args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
+}
+
 tasks.test {
     useJUnitPlatform()
     // KillRecoveryTest starts a second JVM with the same classes.
