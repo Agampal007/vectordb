@@ -62,8 +62,13 @@ class KillRecoveryTest {
                 }
                 writer.destroyForcibly();
                 // Acknowledgements already in the pipe when the kill landed still count.
-                while ((line = output.readLine()) != null) {
-                    acknowledged = ackedId(line, acknowledged);
+                try {
+                    while ((line = output.readLine()) != null) {
+                        acknowledged = ackedId(line, acknowledged);
+                    }
+                } catch (IOException e) {
+                    // On Linux, destroying a process closes its streams, so whatever was still in
+                    // the pipe cannot be read. Missing those only makes the check below weaker.
                 }
             }
             assertTrue(writer.waitFor(30, TimeUnit.SECONDS));
