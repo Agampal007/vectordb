@@ -1,5 +1,9 @@
 package io.github.agampal007.vectordb;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.BitSet;
@@ -61,6 +65,10 @@ public final class HnswIndex implements VectorIndex {
     };
 
     private static final int INITIAL_CAPACITY = 16;
+    /** Floats converted per chunk when reading or writing vectors. */
+    private static final int VECTOR_IO_CHUNK = 1 << 16;
+    /** Far above any level the exponential distribution produces; guards against corrupt input. */
+    private static final int MAX_LEVEL = 64;
 
     private final int dimension;
     private final Distance distance;
@@ -103,6 +111,16 @@ public final class HnswIndex implements VectorIndex {
             int efConstruction,
             int efSearch,
             long seed) {
+        this(dimension, distance, maxConnections, efConstruction, efSearch, new Lcg(seed));
+    }
+
+    private HnswIndex(
+            int dimension,
+            Distance distance,
+            int maxConnections,
+            int efConstruction,
+            int efSearch,
+            Lcg random) {
         if (dimension <= 0) {
             throw new IllegalArgumentException("dimension must be positive: " + dimension);
         }
@@ -123,7 +141,7 @@ public final class HnswIndex implements VectorIndex {
         this.efConstruction = efConstruction;
         this.efSearch = efSearch;
         this.levelMultiplier = 1.0 / Math.log(maxConnections);
-        this.random = new Lcg(seed);
+        this.random = random;
         this.data = new float[INITIAL_CAPACITY * dimension];
     }
 
@@ -382,6 +400,115 @@ public final class HnswIndex implements VectorIndex {
     int randomLevel() {
         double uniform = 1.0 - random.nextDouble();
         return (int) Math.floor(-Math.log(uniform) * levelMultiplier);
+    }
+
+    /**
+     * Writes the complete state: parameters, level generator, graph, tombstones and vectors. An
+     * index read back with {@link #readFrom} behaves exactly as this one would from here on.
+     */
+    public void writeTo(DataOutputStream out) throws IOException {
+        out.writeInt(dimension);
+        out.writeUTF(distance.name());
+        out.writeInt(maxConnections);
+        out.writeInt(efConstruction);
+        out.writeInt(efSearch);
+        out.writeLong(random.state());
+        out.writeInt(nodes.size());
+        out.writeInt(entryPoint);
+        for (int i = 0; i < nodes.size(); i++) {
+            Node node = nodes.get(i);
+            out.writeLong(node.id);
+            out.writeBoolean(removed.get(i));
+            out.writeInt(node.level());
+            for (int layer = 0; layer <= node.level(); layer++) {
+                out.writeInt(node.neighbourCount[layer]);
+                for (int j = 0; j < node.neighbourCount[layer]; j++) {
+                    out.writeInt(node.neighbours[layer][j]);
+                }
+            }
+        }
+        ByteBuffer chunk = ByteBuffer.allocate(4 * VECTOR_IO_CHUNK);
+        int total = nodes.size() * dimension;
+        for (int offset = 0; offset < total; offset += VECTOR_IO_CHUNK) {
+            int count = Math.min(VECTOR_IO_CHUNK, total - offset);
+            chunk.asFloatBuffer().put(data, offset, count);
+            out.write(chunk.array(), 0, 4 * count);
+        }
+    }
+
+    /**
+     * Reads an index written by {@link #writeTo}.
+     *
+     * @param maxBytes size of the source, used to reject impossible counts before allocating
+     * @throws IOException if the content is not a valid index
+     */
+    public static HnswIndex readFrom(DataInputStream in, long maxBytes) throws IOException {
+        int dimension = in.readInt();
+        Distance distance;
+        try {
+            distance = Distance.valueOf(in.readUTF());
+        } catch (IllegalArgumentException e) {
+            throw new IOException("unknown distance metric", e);
+        }
+        int maxConnections = in.readInt();
+        int efConstruction = in.readInt();
+        int efSearch = in.readInt();
+        Lcg random = Lcg.fromState(in.readLong());
+        int nodeCount = in.readInt();
+        int entryPoint = in.readInt();
+        HnswIndex index;
+        try {
+            index = new HnswIndex(dimension, distance, maxConnections, efConstruction, efSearch, random);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("invalid index parameters", e);
+        }
+        if (nodeCount < 0 || 4L * nodeCount * dimension > maxBytes || entryPoint < -1 || entryPoint >= nodeCount) {
+            throw new IOException("impossible node count or entry point");
+        }
+        for (int i = 0; i < nodeCount; i++) {
+            long id = in.readLong();
+            boolean isRemoved = in.readBoolean();
+            int level = in.readInt();
+            if (level < 0 || level > MAX_LEVEL) {
+                throw new IOException("impossible level " + level);
+            }
+            Node node = new Node(id, level, maxConnections, index.maxConnectionsLayer0);
+            for (int layer = 0; layer <= level; layer++) {
+                int count = in.readInt();
+                if (count < 0 || count > node.neighbours[layer].length) {
+                    throw new IOException("impossible neighbour count " + count);
+                }
+                node.neighbourCount[layer] = count;
+                for (int j = 0; j < count; j++) {
+                    int neighbour = in.readInt();
+                    if (neighbour < 0 || neighbour >= nodeCount) {
+                        throw new IOException("link to a node that does not exist");
+                    }
+                    node.neighbours[layer][j] = neighbour;
+                }
+            }
+            index.nodes.add(node);
+            if (isRemoved) {
+                index.removed.set(i);
+            } else if (index.nodeById.put(id, i) != null) {
+                throw new IOException("duplicate id " + id);
+            }
+        }
+        int total = nodeCount * dimension;
+        index.data = new float[Math.max(total, INITIAL_CAPACITY * dimension)];
+        byte[] bytes = new byte[4 * VECTOR_IO_CHUNK];
+        for (int offset = 0; offset < total; offset += VECTOR_IO_CHUNK) {
+            int count = Math.min(VECTOR_IO_CHUNK, total - offset);
+            in.readFully(bytes, 0, 4 * count);
+            ByteBuffer.wrap(bytes, 0, 4 * count).asFloatBuffer().get(index.data, offset, count);
+        }
+        index.entryPoint = entryPoint;
+        return index;
+    }
+
+    /** Nodes in the graph, including removed ones. For tests. */
+    int nodeCount() {
+        return nodes.size();
     }
 
     /** Top layer of node {@code node}, in insertion order. For tests. */
