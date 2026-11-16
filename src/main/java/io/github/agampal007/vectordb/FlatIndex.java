@@ -69,6 +69,34 @@ public final class FlatIndex implements VectorIndex {
     }
 
     @Override
+    public boolean contains(long id) {
+        return rowById.containsKey(id);
+    }
+
+    @Override
+    public float[] get(long id) {
+        Integer row = rowById.get(id);
+        return row == null ? null : Arrays.copyOfRange(data, row * dimension, (row + 1) * dimension);
+    }
+
+    /** Removes a vector by moving the last row into its place, so rows stay packed. */
+    @Override
+    public boolean remove(long id) {
+        Integer row = rowById.remove(id);
+        if (row == null) {
+            return false;
+        }
+        int last = size - 1;
+        if (row != last) {
+            System.arraycopy(data, last * dimension, data, row * dimension, dimension);
+            ids[row] = ids[last];
+            rowById.put(ids[row], row);
+        }
+        size--;
+        return true;
+    }
+
+    @Override
     public List<SearchResult> search(float[] query, int k) {
         checkDimension(query);
         if (k <= 0) {

@@ -1,14 +1,18 @@
 package io.github.agampal007.vectordb;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
+import java.io.IOException;
+import java.nio.ByteBuffer;
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.BitSet;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
-import java.util.Random;
 
 /**
  * Approximate nearest-neighbour index using a Hierarchical Navigable Small World graph.
@@ -23,8 +27,11 @@ import java.util.Random;
  * beam search ({@code ef} candidates) on the bottom layer.
  *
  * <p>Neighbours are chosen with the paper's heuristic (Algorithm 4) without its optional
- * candidate extension or kept-pruned connections, which is also what hnswlib does. Not
- * thread-safe.
+ * candidate extension or kept-pruned connections, which is also what hnswlib does.
+ *
+ * <p>Removal is by tombstone: a removed node stays in the graph so that searches can still pass
+ * through it, but it is never returned. Its memory is not reclaimed, so an index with heavy churn
+ * should be rebuilt. Not thread-safe.
  */
 public final class HnswIndex implements VectorIndex {
 
@@ -58,6 +65,10 @@ public final class HnswIndex implements VectorIndex {
     };
 
     private static final int INITIAL_CAPACITY = 16;
+    /** Floats converted per chunk when reading or writing vectors. */
+    private static final int VECTOR_IO_CHUNK = 1 << 16;
+    /** Far above any level the exponential distribution produces; guards against corrupt input. */
+    private static final int MAX_LEVEL = 64;
 
     private final int dimension;
     private final Distance distance;
@@ -71,10 +82,13 @@ public final class HnswIndex implements VectorIndex {
     private int efSearch;
     /** {@code mL = 1 / ln(M)}, the level normaliser from the paper. */
     private final double levelMultiplier;
-    private final Random random;
+    private final Lcg random;
 
     private final List<Node> nodes = new ArrayList<>();
+    /** Live ids only: a removed node keeps its slot in {@link #nodes} but leaves this map. */
     private final Map<Long, Integer> nodeById = new HashMap<>();
+    /** Tombstones, by node index. */
+    private final BitSet removed = new BitSet();
     /** Vectors packed row-major, as in {@link FlatIndex}; row {@code i} belongs to node {@code i}. */
     private float[] data;
     private int entryPoint = -1;
@@ -97,6 +111,16 @@ public final class HnswIndex implements VectorIndex {
             int efConstruction,
             int efSearch,
             long seed) {
+        this(dimension, distance, maxConnections, efConstruction, efSearch, new Lcg(seed));
+    }
+
+    private HnswIndex(
+            int dimension,
+            Distance distance,
+            int maxConnections,
+            int efConstruction,
+            int efSearch,
+            Lcg random) {
         if (dimension <= 0) {
             throw new IllegalArgumentException("dimension must be positive: " + dimension);
         }
@@ -117,7 +141,7 @@ public final class HnswIndex implements VectorIndex {
         this.efConstruction = efConstruction;
         this.efSearch = efSearch;
         this.levelMultiplier = 1.0 / Math.log(maxConnections);
-        this.random = new Random(seed);
+        this.random = random;
         this.data = new float[INITIAL_CAPACITY * dimension];
     }
 
@@ -133,7 +157,29 @@ public final class HnswIndex implements VectorIndex {
 
     @Override
     public int size() {
-        return nodes.size();
+        return nodeById.size();
+    }
+
+    @Override
+    public boolean contains(long id) {
+        return nodeById.containsKey(id);
+    }
+
+    @Override
+    public float[] get(long id) {
+        Integer node = nodeById.get(id);
+        return node == null ? null : Arrays.copyOfRange(data, node * dimension, (node + 1) * dimension);
+    }
+
+    /** Marks the node as removed. It stays linked into the graph but is never returned. */
+    @Override
+    public boolean remove(long id) {
+        Integer node = nodeById.remove(id);
+        if (node == null) {
+            return false;
+        }
+        removed.set(node);
+        return true;
     }
 
     public int efSearch() {
@@ -176,7 +222,7 @@ public final class HnswIndex implements VectorIndex {
         List<Candidate> entryPoints = List.of(nearest);
         Node inserted = nodes.get(node);
         for (int layer = Math.min(level, entryLevel); layer >= 0; layer--) {
-            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer);
+            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer, false);
             for (Candidate neighbour : selectNeighbours(found, maxConnections)) {
                 inserted.neighbours[layer][inserted.neighbourCount[layer]++] = neighbour.node();
                 link(neighbour.node(), node, neighbour.distance(), layer);
@@ -205,7 +251,7 @@ public final class HnswIndex implements VectorIndex {
         for (int layer = nodes.get(entryPoint).level(); layer > 0; layer--) {
             nearest = greedyClosest(query, nearest, layer);
         }
-        List<Candidate> found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0);
+        List<Candidate> found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0, true);
 
         int count = Math.min(k, found.size());
         List<SearchResult> results = new ArrayList<>(count);
@@ -221,25 +267,30 @@ public final class HnswIndex implements VectorIndex {
      * Beam search on one layer (Algorithm 2). Expands the closest unexpanded candidate until the
      * closest one left is further than the worst of the {@code ef} best found so far.
      *
+     * <p>With {@code liveOnly}, removed nodes are still expanded, because the path to a live
+     * neighbour may run through them, but they do not take a place among the results.
+     *
      * @return up to {@code ef} nodes, closest first
      */
     private List<Candidate> searchLayer(
-            float[] query, List<Candidate> entryPoints, int ef, int layer) {
+            float[] query, List<Candidate> entryPoints, int ef, int layer, boolean liveOnly) {
         int epoch = nextVisitEpoch();
         PriorityQueue<Candidate> toExpand = new PriorityQueue<>(CLOSEST_FIRST);
         PriorityQueue<Candidate> best = new PriorityQueue<>(CLOSEST_FIRST.reversed());
         for (Candidate entry : entryPoints) {
             visited[entry.node()] = epoch;
             toExpand.add(entry);
-            best.add(entry);
-            if (best.size() > ef) {
-                best.poll();
+            if (!liveOnly || !removed.get(entry.node())) {
+                best.add(entry);
+                if (best.size() > ef) {
+                    best.poll();
+                }
             }
         }
 
         while (!toExpand.isEmpty()) {
             Candidate current = toExpand.poll();
-            if (current.distance() > best.peek().distance()) {
+            if (best.size() >= ef && current.distance() > best.peek().distance()) {
                 break;
             }
             Node node = nodes.get(current.node());
@@ -254,9 +305,11 @@ public final class HnswIndex implements VectorIndex {
                 if (best.size() < ef || d < best.peek().distance()) {
                     Candidate candidate = new Candidate(next, d);
                     toExpand.add(candidate);
-                    best.add(candidate);
-                    if (best.size() > ef) {
-                        best.poll();
+                    if (!liveOnly || !removed.get(next)) {
+                        best.add(candidate);
+                        if (best.size() > ef) {
+                            best.poll();
+                        }
                     }
                 }
             }
@@ -347,6 +400,115 @@ public final class HnswIndex implements VectorIndex {
     int randomLevel() {
         double uniform = 1.0 - random.nextDouble();
         return (int) Math.floor(-Math.log(uniform) * levelMultiplier);
+    }
+
+    /**
+     * Writes the complete state: parameters, level generator, graph, tombstones and vectors. An
+     * index read back with {@link #readFrom} behaves exactly as this one would from here on.
+     */
+    public void writeTo(DataOutputStream out) throws IOException {
+        out.writeInt(dimension);
+        out.writeUTF(distance.name());
+        out.writeInt(maxConnections);
+        out.writeInt(efConstruction);
+        out.writeInt(efSearch);
+        out.writeLong(random.state());
+        out.writeInt(nodes.size());
+        out.writeInt(entryPoint);
+        for (int i = 0; i < nodes.size(); i++) {
+            Node node = nodes.get(i);
+            out.writeLong(node.id);
+            out.writeBoolean(removed.get(i));
+            out.writeInt(node.level());
+            for (int layer = 0; layer <= node.level(); layer++) {
+                out.writeInt(node.neighbourCount[layer]);
+                for (int j = 0; j < node.neighbourCount[layer]; j++) {
+                    out.writeInt(node.neighbours[layer][j]);
+                }
+            }
+        }
+        ByteBuffer chunk = ByteBuffer.allocate(4 * VECTOR_IO_CHUNK);
+        int total = nodes.size() * dimension;
+        for (int offset = 0; offset < total; offset += VECTOR_IO_CHUNK) {
+            int count = Math.min(VECTOR_IO_CHUNK, total - offset);
+            chunk.asFloatBuffer().put(data, offset, count);
+            out.write(chunk.array(), 0, 4 * count);
+        }
+    }
+
+    /**
+     * Reads an index written by {@link #writeTo}.
+     *
+     * @param maxBytes size of the source, used to reject impossible counts before allocating
+     * @throws IOException if the content is not a valid index
+     */
+    public static HnswIndex readFrom(DataInputStream in, long maxBytes) throws IOException {
+        int dimension = in.readInt();
+        Distance distance;
+        try {
+            distance = Distance.valueOf(in.readUTF());
+        } catch (IllegalArgumentException e) {
+            throw new IOException("unknown distance metric", e);
+        }
+        int maxConnections = in.readInt();
+        int efConstruction = in.readInt();
+        int efSearch = in.readInt();
+        Lcg random = Lcg.fromState(in.readLong());
+        int nodeCount = in.readInt();
+        int entryPoint = in.readInt();
+        HnswIndex index;
+        try {
+            index = new HnswIndex(dimension, distance, maxConnections, efConstruction, efSearch, random);
+        } catch (IllegalArgumentException e) {
+            throw new IOException("invalid index parameters", e);
+        }
+        if (nodeCount < 0 || 4L * nodeCount * dimension > maxBytes || entryPoint < -1 || entryPoint >= nodeCount) {
+            throw new IOException("impossible node count or entry point");
+        }
+        for (int i = 0; i < nodeCount; i++) {
+            long id = in.readLong();
+            boolean isRemoved = in.readBoolean();
+            int level = in.readInt();
+            if (level < 0 || level > MAX_LEVEL) {
+                throw new IOException("impossible level " + level);
+            }
+            Node node = new Node(id, level, maxConnections, index.maxConnectionsLayer0);
+            for (int layer = 0; layer <= level; layer++) {
+                int count = in.readInt();
+                if (count < 0 || count > node.neighbours[layer].length) {
+                    throw new IOException("impossible neighbour count " + count);
+                }
+                node.neighbourCount[layer] = count;
+                for (int j = 0; j < count; j++) {
+                    int neighbour = in.readInt();
+                    if (neighbour < 0 || neighbour >= nodeCount) {
+                        throw new IOException("link to a node that does not exist");
+                    }
+                    node.neighbours[layer][j] = neighbour;
+                }
+            }
+            index.nodes.add(node);
+            if (isRemoved) {
+                index.removed.set(i);
+            } else if (index.nodeById.put(id, i) != null) {
+                throw new IOException("duplicate id " + id);
+            }
+        }
+        int total = nodeCount * dimension;
+        index.data = new float[Math.max(total, INITIAL_CAPACITY * dimension)];
+        byte[] bytes = new byte[4 * VECTOR_IO_CHUNK];
+        for (int offset = 0; offset < total; offset += VECTOR_IO_CHUNK) {
+            int count = Math.min(VECTOR_IO_CHUNK, total - offset);
+            in.readFully(bytes, 0, 4 * count);
+            ByteBuffer.wrap(bytes, 0, 4 * count).asFloatBuffer().get(index.data, offset, count);
+        }
+        index.entryPoint = entryPoint;
+        return index;
+    }
+
+    /** Nodes in the graph, including removed ones. For tests. */
+    int nodeCount() {
+        return nodes.size();
     }
 
     /** Top layer of node {@code node}, in insertion order. For tests. */
