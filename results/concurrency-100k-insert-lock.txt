@@ -1,0 +1,47 @@
+Before and after the insert was split into prepare and commit, run back to back in this order:
+before, after, before, after. Same machine, same settings as results/concurrency-100k.txt.
+"Before" is the code at commit fcf365b; "after" is commit aefc4b0.
+
+=== Before, run 1 ===
+
+| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
+| --- | --- | --- | --- | --- |
+| 1 | 2,009 | 2,009 | 1,125 | 505 |
+| 2 | 4,758 | 2,379 | 2,433 | 502 |
+| 4 | 17,460 | 4,365 | 9,651 | 776 |
+| 8 | 29,337 | 3,667 | 13,058 | 529 |
+| 16 | 49,539 | 3,096 | 23,438 | 517 |
+| 24 | 62,270 | 2,595 | 57,545 | 77 |
+
+=== After, run 1 ===
+
+| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
+| --- | --- | --- | --- | --- |
+| 1 | 4,557 | 4,557 | 4,092 | 830 |
+| 2 | 9,299 | 4,650 | 8,424 | 800 |
+| 4 | 19,127 | 4,782 | 16,916 | 821 |
+| 8 | 36,633 | 4,579 | 33,336 | 544 |
+| 16 | 56,243 | 3,515 | 40,760 | 466 |
+| 24 | 55,844 | 2,327 | 58,799 | 116 |
+
+=== Before, run 2 ===
+
+| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
+| --- | --- | --- | --- | --- |
+| 1 | 4,182 | 4,182 | 1,639 | 616 |
+| 2 | 5,295 | 2,647 | 4,848 | 786 |
+| 4 | 18,739 | 4,685 | 9,572 | 769 |
+| 8 | 35,975 | 4,497 | 14,514 | 576 |
+| 16 | 42,416 | 2,651 | 16,798 | 435 |
+| 24 | 50,835 | 2,118 | 33,764 | 253 |
+
+=== After, run 2 ===
+
+| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
+| --- | --- | --- | --- | --- |
+| 1 | 2,210 | 2,210 | 2,159 | 502 |
+| 2 | 4,974 | 2,487 | 4,888 | 518 |
+| 4 | 16,419 | 4,105 | 15,493 | 729 |
+| 8 | 33,899 | 4,237 | 29,131 | 521 |
+| 16 | 51,686 | 3,230 | 44,725 | 473 |
+| 24 | 64,275 | 2,678 | 50,283 | 355 |

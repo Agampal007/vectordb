@@ -12,8 +12,8 @@ writes when a node dies.
 > recall@10 of 0.975 at 169x the speed of exact search, and 0.993 at 92x, on a single thread.
 > Writes are logged before they are applied and survive killing the process; recovery from a
 > snapshot is 368x faster than replaying the log. It runs as an HTTP service, in Docker, with
-> searches on every core: 57,000 to 71,000 a second on 24 threads over 100,000 vectors.
-> Replication is next.
+> searches on every core (51,000 to 71,000 a second on 24 threads over 100,000 vectors) that keep
+> most of their speed while a writer runs. Replication is next.
 > Benchmark numbers below come only from real runs.
 
 ## Build
@@ -41,7 +41,7 @@ scripts/download_sift.sh   # SIFT-1M into data/sift (160 MB download)
 | Determinism | Seeded level assignment with saveable generator state, ties broken by id | Reproducible tests and benchmarks; replaying the same operations rebuilds the same graph |
 | Deletes | Tombstones: a removed node stays linked but is never returned | Removing a node from an HNSW graph would break paths that run through it |
 | Durability | Append-only WAL with a CRC32 and sequence number per record; snapshots written to a temporary file and renamed | No acknowledged write is lost in a crash, and recovery does not have to rebuild the graph from scratch |
-| Concurrency | One writer at a time; a read-write lock around the graph, taken exclusively only for the change in memory | Searches run on every core and never wait for a log write, an fsync or a snapshot |
+| Concurrency | One writer at a time; a read-write lock around the graph, taken exclusively only to link a new node in | Searches run on every core and never wait for a log write, an fsync, a snapshot, or the search an insert does for its neighbours |
 | Service | HTTP and JSON on the JDK's built-in server, a virtual thread per request, no dependencies | Anything can call it with `curl`; nothing to audit but this repository |
 | Replication (M6) | WAL shipping from leader to followers | Simple, testable; Raft is the stretch goal |
 
@@ -57,7 +57,7 @@ scripts/download_sift.sh   # SIFT-1M into data/sift (160 MB download)
 | 6 | 7–8 | **Replication.** Leader ships WAL to followers, follower catch-up, manual failover; Docker Compose cluster | Failure test: kill the leader, promote a follower, no acknowledged write lost |
 
 Stretch: SIMD distance kernels with the Java Vector API (benchmarked with JMH), multi-threaded
-builds, inserts that hold the exclusive lock only while linking, group commit for the log,
+builds, group commit for the log,
 reclaiming removed vectors, GloVe-100 for angular distance,
 product quantisation, Raft, and plugging this in as a retriever backend for
 [rag-retrieval-bench](https://github.com/Agampal007/rag-retrieval-bench).
@@ -210,11 +210,24 @@ floating-point number.
   in memory. Operations therefore reach the log in the order they were applied, which is what
   makes replay rebuild the same graph.
 - A **graph lock**, a read-write lock around the in-memory index. Searches share it. A writer
-  takes it exclusively only for the change in memory, after its log append has returned.
+  takes it exclusively only to link a new node in.
 
-So a search can wait for an insert into the graph, but never for the disk: not for a log append,
-not for an fsync, and not for a snapshot, which only reads the index. Each search also borrows
-its own scratch space, where the single-threaded index shared one.
+An insert spends nearly all its time finding the new vector's neighbours, and that only reads
+the graph. So an insert has two halves. `prepareAdd` finds the neighbours and works out the link
+lists they will have, holding only the writer lock, while searches carry on. `commit` then takes
+the graph lock exclusively and applies the result, which is a handful of array copies. Nothing
+can change the graph between the two halves, because only the holder of the writer lock writes.
+
+A search therefore waits only for that linking step, and never for the disk: not for a log
+append, not for an fsync, and not for a snapshot, which only reads the index. Each search also
+borrows its own scratch space, where the single-threaded index shared one.
+
+Splitting the insert did not change what it builds. On each layer the search looks only at that
+layer's links, the new node cannot be reached until it is linked, and the neighbours chosen on a
+layer are distinct, so no step depends on a change an earlier step would have made.
+`GraphFingerprintTest` pins the SHA-256 of four graphs as the one-step insert built them. That
+matters beyond tidiness: the log stores operations, so a log written by an older build must
+replay into the graph that build had.
 
 What the tests check:
 
@@ -223,15 +236,17 @@ What the tests check:
 | Eight threads searching at once get exactly the results one thread gets | `ConcurrencyTest` |
 | While a writer adds and removes and another thread snapshots, no search returns a vector whose removal had already returned, and the final graph equals a single-threaded build, in memory and after reopening | `ConcurrencyTest` |
 | With four writers at once, replaying the log rebuilds the graph that was in memory | `ConcurrencyTest` |
+| The insert builds, bit for bit, the graphs it built before it was split, for each metric, with removals, re-added ids and tied distances | `GraphFingerprintTest` |
+| Preparing an insert changes nothing a search can see; a plan is refused once the graph has moved on | `PrepareCommitTest` |
 | A second opener is refused, in the same process and from another one, and is admitted once the holder is killed | `DirectoryLockTest` |
 | Search results over HTTP equal the results of calling the index directly | `VectorDbServerTest` |
 | 36 malformed or misdirected requests are refused and change nothing on disk | `VectorDbServerTest` |
 | Data survives a server restart; concurrent clients reading and writing all succeed | `VectorDbServerTest` |
 | In Docker: after `docker stop` the snapshot is loaded and nothing is replayed; after `docker kill` the log is replayed; the data is intact both times | the `docker` job in CI |
 
-The three `ConcurrencyTest` checks were each seen to fail with the lock they cover removed:
-sharing one scratch space between searches, returning removed vectors, and dropping the writer
-lock.
+The `ConcurrencyTest` checks were each seen to fail with the lock they cover removed: sharing
+one scratch space between searches, returning removed vectors, dropping the writer lock, and
+linking a new node in under the shared lock instead of the exclusive one.
 
 ### What it measures
 
@@ -243,44 +258,64 @@ vectors one at a time and fsyncs each.
 
 | Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
 | --- | --- | --- | --- | --- |
-| 1 | 2,053 | 2,053 | 896 | 411 |
-| 2 | 4,132 | 2,066 | 1,905 | 400 |
-| 4 | 9,595 | 2,399 | 4,400 | 461 |
-| 8 | 21,611 | 2,701 | 7,850 | 374 |
-| 16 | 48,204 | 3,013 | 9,492 | 233 |
-| 24 | 69,981 | 2,916 | 38,933 | 252 |
+| 1 | 4,358 | 4,358 | 4,091 | 842 |
+| 2 | 9,074 | 4,537 | 8,278 | 806 |
+| 4 | 18,308 | 4,577 | 12,734 | 580 |
+| 8 | 30,364 | 3,796 | 31,884 | 532 |
+| 16 | 52,821 | 3,301 | 45,364 | 479 |
+| 24 | 64,141 | 2,673 | 60,908 | 90 |
 
-- **Searches use every core.** Throughput went from 2,053 searches a second on one thread to
-  69,981 on 24. Two earlier runs gave 56,575 and 70,884 at 24 threads, so read that figure as
-  57,000 to 71,000.
-- **No speed-up factor is quoted, because the one-thread row is not a clean baseline.**
-  Throughput per thread rises with the thread count, which the code cannot cause. The likely
-  reason is that the operating system decides which kind of core and which clock speed a lone
-  thread gets; that was not verified.
-- **One writer costs searches more than half their throughput at most thread counts.** At 100,000
-  vectors an insert takes about 0.33 ms, and it needs the graph to itself: searches already
-  running have to finish first, and new ones queue behind the writer. With 16 search threads that
-  left 9,492 searches a second against 48,204 with no writer. The known fixes are to search for
-  the new vector's neighbours under the shared lock and take the exclusive lock only to link it
-  in, or per-node locks as hnswlib uses. Neither is done.
-- **Searches slow the writer down too**: 411 inserts a second next to one search thread, 252 next
-  to 24.
+- **Searches use every core.** Throughput went from 4,358 searches a second on one thread to
+  64,141 on 24. Across eight runs of this benchmark the 24-thread figure ranged from 50,835 to
+  70,884.
+- **This laptop is a noisy place to measure, so no speed-up factor is quoted.** The one-thread
+  figure came out near 2,100 in some runs and near 4,400 in others, with nothing changed between
+  them. Two speeds are what a lone thread landing on an efficiency core or a performance core
+  would give, but that was not verified. Compare columns within a row, which were measured one
+  after the other, before comparing rows or runs.
+- **At 24 search threads the writer is starved.** Every core is already searching, the writer is
+  a 25th thread, and it managed 77 to 355 inserts a second across runs, against 400 to 840 with
+  one search thread.
+
+**What moving the neighbour search out of the exclusive lock bought.** Before the insert was
+split, it held the graph exclusively for its whole 0.33 ms. The old and new code were run back to
+back, twice each (`results/concurrency-100k-insert-lock.txt`). The table shows how much of their
+no-writer throughput searches kept once a writer was running, in each of the two runs:
+
+| Search threads | Kept before | Kept after |
+| --- | --- | --- |
+| 1 | 56%, 39% | 90%, 98% |
+| 2 | 51%, 92% | 91%, 98% |
+| 4 | 55%, 51% | 88%, 94% |
+| 8 | 45%, 40% | 91%, 86% |
+| 16 | 47%, 40% | 72%, 87% |
+| 24 | 92%, 66% | 105%, 78% |
+
+- **From 1 to 16 search threads, searches kept 39% to 56% of their throughput before and 72% to
+  98% after.** The one exception before, 92% at 2 threads, is a slow run without the writer, not
+  a fast one with it: two threads managed 5,295 searches a second where one thread had just
+  managed 4,182.
+- **The 24-thread row shows no clear change.** It was noisy in both versions, for the reason
+  given above.
+- **What is left.** The writer still needs the graph to itself to link the node in, so it waits
+  for the searches in flight to finish, and searches that arrive meanwhile wait behind it.
+  Per-node locks, as hnswlib uses, would remove that wait; they are not done.
 
 The same searches through the HTTP API on localhost, with `GET /health`, which does no work, as
 the baseline:
 
 | Request | Clients | Requests/s | Median latency | 99th percentile |
 | --- | --- | --- | --- | --- |
-| `GET /health` | 1 | 444 | 2.04 ms | 5.32 ms |
-| `POST search` | 1 | 313 | 2.81 ms | 6.79 ms |
-| `GET /health` | 8 | 6,123 | 1.28 ms | 2.07 ms |
-| `POST search` | 8 | 4,466 | 1.76 ms | 2.94 ms |
-| `GET /health` | 24 | 7,173 | 3.29 ms | 5.07 ms |
-| `POST search` | 24 | 6,114 | 3.83 ms | 5.97 ms |
+| `GET /health` | 1 | 747 | 1.29 ms | 2.43 ms |
+| `POST search` | 1 | 531 | 1.79 ms | 3.86 ms |
+| `GET /health` | 8 | 6,184 | 1.27 ms | 1.86 ms |
+| `POST search` | 8 | 4,545 | 1.72 ms | 2.53 ms |
+| `GET /health` | 24 | 6,593 | 3.56 ms | 5.81 ms |
+| `POST search` | 24 | 6,201 | 3.77 ms | 6.08 ms |
 
 - **The HTTP layer, not the index, sets the latency here.** A request that does nothing takes
-  1.3 to 3.3 ms, and a search adds 0.5 to 0.8 ms to that. With 8 clients the service answered 4,466
-  searches a second, where 8 threads calling the index directly managed 21,611.
+  1.3 to 3.6 ms, and a search adds 0.2 to 0.5 ms to that. With 8 clients the service answered 4,545
+  searches a second, where 8 threads calling the index directly managed 30,364.
 - This was measured on Windows with the JDK's built-in server and client. It has not been measured
   on Linux or with another client, so it says little about the cost elsewhere.
 
