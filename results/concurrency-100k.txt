@@ -3,21 +3,21 @@ SIFT, first 100,000 vectors, 128 dimensions, M = 16, efConstruction = 200, efSea
 
 | Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
 | --- | --- | --- | --- | --- |
-| 1 | 2,053 | 2,053 | 896 | 411 |
-| 2 | 4,132 | 2,066 | 1,905 | 400 |
-| 4 | 9,595 | 2,399 | 4,400 | 461 |
-| 8 | 21,611 | 2,701 | 7,850 | 374 |
-| 16 | 48,204 | 3,013 | 9,492 | 233 |
-| 24 | 69,981 | 2,916 | 38,933 | 252 |
+| 1 | 4,358 | 4,358 | 4,091 | 842 |
+| 2 | 9,074 | 4,537 | 8,278 | 806 |
+| 4 | 18,308 | 4,577 | 12,734 | 580 |
+| 8 | 30,364 | 3,796 | 31,884 | 532 |
+| 16 | 52,821 | 3,301 | 45,364 | 479 |
+| 24 | 64,141 | 2,673 | 60,908 | 90 |
 
 Through the HTTP API on localhost (JSON in and out, one connection per client).
 GET /health does no work, so it shows what the HTTP layer alone costs:
 
 | Request | Clients | Requests/s | Median latency | 99th percentile |
 | --- | --- | --- | --- | --- |
-| GET /health | 1 | 444 | 2.04 ms | 5.32 ms |
-| POST search | 1 | 313 | 2.81 ms | 6.79 ms |
-| GET /health | 8 | 6,123 | 1.28 ms | 2.07 ms |
-| POST search | 8 | 4,466 | 1.76 ms | 2.94 ms |
-| GET /health | 24 | 7,173 | 3.29 ms | 5.07 ms |
-| POST search | 24 | 6,114 | 3.83 ms | 5.97 ms |
+| GET /health | 1 | 747 | 1.29 ms | 2.43 ms |
+| POST search | 1 | 531 | 1.79 ms | 3.86 ms |
+| GET /health | 8 | 6,184 | 1.27 ms | 1.86 ms |
+| POST search | 8 | 4,545 | 1.72 ms | 2.53 ms |
+| GET /health | 24 | 6,593 | 3.56 ms | 5.81 ms |
+| POST search | 24 | 6,201 | 3.77 ms | 6.08 ms |
