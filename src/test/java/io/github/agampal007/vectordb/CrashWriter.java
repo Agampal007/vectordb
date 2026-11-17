@@ -1,13 +1,14 @@
 package io.github.agampal007.vectordb;
 
 import io.github.agampal007.vectordb.wal.WriteAheadLog.SyncPolicy;
+import java.io.IOException;
 import java.nio.file.Path;
 import java.util.Random;
 
 /**
- * The process that {@link KillRecoveryTest} kills. It adds vectors to a durable index for ever,
- * printing {@code ACK <id>} once each add has returned, and snapshots every few adds so that some
- * kills land in the middle of a snapshot.
+ * The process that {@link KillRecoveryTest} and {@link DirectoryLockTest} kill. It adds vectors to
+ * a durable index for ever, printing {@code ACK <id>} once each add has returned, and snapshots
+ * every few adds so that some kills land in the middle of a snapshot.
  */
 public final class CrashWriter {
 
@@ -27,6 +28,20 @@ public final class CrashWriter {
             vector[i] = random.nextFloat() * 2f - 1f;
         }
         return vector;
+    }
+
+    /** Starts this class in a second JVM with the same classes as the test that calls it. */
+    static Process start(Path directory, int snapshotEvery) throws IOException {
+        String classpath = System.getProperty("vectordb.test.classpath", System.getProperty("java.class.path"));
+        ProcessBuilder builder = new ProcessBuilder(
+                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
+                "-cp",
+                classpath,
+                CrashWriter.class.getName(),
+                directory.toString(),
+                Integer.toString(snapshotEvery));
+        builder.redirectError(ProcessBuilder.Redirect.INHERIT);
+        return builder.start();
     }
 
     public static void main(String[] args) throws Exception {

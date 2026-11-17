@@ -43,7 +43,7 @@ class KillRecoveryTest {
         Random random = new Random(2026);
         long acknowledged = -1;
         for (int round = 0; round < ROUNDS; round++) {
-            Process writer = startWriter();
+            Process writer = CrashWriter.start(dir, SNAPSHOT_EVERY);
             int killAfter = 10 + random.nextInt(40);
             long killDelayNanos = random.nextInt(MAX_KILL_DELAY_MICROS) * 1_000L;
             try (BufferedReader output = writer.inputReader()) {
@@ -99,18 +99,5 @@ class KillRecoveryTest {
             TestGraphs.assertSameGraph(uninterrupted, index.index());
             assertEquals(size, index.index().nodeCount());
         }
-    }
-
-    private Process startWriter() throws IOException {
-        String classpath = System.getProperty("vectordb.test.classpath", System.getProperty("java.class.path"));
-        ProcessBuilder builder = new ProcessBuilder(
-                Path.of(System.getProperty("java.home"), "bin", "java").toString(),
-                "-cp",
-                classpath,
-                CrashWriter.class.getName(),
-                dir.toString(),
-                Integer.toString(SNAPSHOT_EVERY));
-        builder.redirectError(ProcessBuilder.Redirect.INHERIT);
-        return builder.start();
     }
 }

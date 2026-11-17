@@ -1,0 +1,23 @@
+SIFT, first 100,000 vectors, 128 dimensions, M = 16, efConstruction = 200, efSearch = 100, k = 10
+24 logical processors, 4 s per measurement after 1 s of warm-up
+
+| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer | Writes/s (fsync each) |
+| --- | --- | --- | --- | --- |
+| 1 | 2,053 | 2,053 | 896 | 411 |
+| 2 | 4,132 | 2,066 | 1,905 | 400 |
+| 4 | 9,595 | 2,399 | 4,400 | 461 |
+| 8 | 21,611 | 2,701 | 7,850 | 374 |
+| 16 | 48,204 | 3,013 | 9,492 | 233 |
+| 24 | 69,981 | 2,916 | 38,933 | 252 |
+
+Through the HTTP API on localhost (JSON in and out, one connection per client).
+GET /health does no work, so it shows what the HTTP layer alone costs:
+
+| Request | Clients | Requests/s | Median latency | 99th percentile |
+| --- | --- | --- | --- | --- |
+| GET /health | 1 | 444 | 2.04 ms | 5.32 ms |
+| POST search | 1 | 313 | 2.81 ms | 6.79 ms |
+| GET /health | 8 | 6,123 | 1.28 ms | 2.07 ms |
+| POST search | 8 | 4,466 | 1.76 ms | 2.94 ms |
+| GET /health | 24 | 7,173 | 3.29 ms | 5.07 ms |
+| POST search | 24 | 6,114 | 3.83 ms | 5.97 ms |

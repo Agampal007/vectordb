@@ -13,6 +13,7 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.PriorityQueue;
+import java.util.concurrent.ConcurrentLinkedQueue;
 
 /**
  * Approximate nearest-neighbour index using a Hierarchical Navigable Small World graph.
@@ -31,7 +32,12 @@ import java.util.PriorityQueue;
  *
  * <p>Removal is by tombstone: a removed node stays in the graph so that searches can still pass
  * through it, but it is never returned. Its memory is not reclaimed, so an index with heavy churn
- * should be rebuilt. Not thread-safe.
+ * should be rebuilt.
+ *
+ * <p>Threading: any number of threads may {@link #search} at the same time, because each search
+ * borrows its own scratch space. {@link #add} and {@link #remove} need exclusive access, with no
+ * search or other write running. This class does not enforce that; {@link DurableIndex} does, with
+ * a read-write lock.
  */
 public final class HnswIndex implements VectorIndex {
 
@@ -52,6 +58,28 @@ public final class HnswIndex implements VectorIndex {
 
         int level() {
             return neighbours.length - 1;
+        }
+    }
+
+    /**
+     * Which nodes one layer search has seen. {@code marks[n] == epoch} means node {@code n} was
+     * seen in the current search; bumping the epoch clears every mark at once instead of
+     * allocating a set per search.
+     */
+    private static final class Visited {
+        int[] marks = new int[INITIAL_CAPACITY];
+        int epoch;
+
+        /** Starts a search over {@code nodeCount} nodes and returns the epoch that marks it. */
+        int nextEpoch(int nodeCount) {
+            if (marks.length < nodeCount) {
+                marks = Arrays.copyOf(marks, Math.max(marks.length * 2, nodeCount));
+            }
+            if (epoch == Integer.MAX_VALUE) {
+                Arrays.fill(marks, 0);
+                epoch = 0;
+            }
+            return ++epoch;
         }
     }
 
@@ -79,7 +107,7 @@ public final class HnswIndex implements VectorIndex {
     /** Beam width while inserting. Higher builds a better graph, more slowly. */
     private final int efConstruction;
     /** Beam width while querying. Trades recall for speed; adjustable after building. */
-    private int efSearch;
+    private volatile int efSearch;
     /** {@code mL = 1 / ln(M)}, the level normaliser from the paper. */
     private final double levelMultiplier;
     private final Lcg random;
@@ -93,12 +121,10 @@ public final class HnswIndex implements VectorIndex {
     private float[] data;
     private int entryPoint = -1;
 
-    /**
-     * {@code visited[n] == visitEpoch} marks node {@code n} as seen in the current layer search.
-     * Bumping the epoch clears every mark at once instead of allocating a set per search.
-     */
-    private int[] visited = new int[INITIAL_CAPACITY];
-    private int visitEpoch;
+    /** Scratch space for {@link #add}, which runs alone. */
+    private final Visited buildVisited = new Visited();
+    /** Spare scratch space for searches: each one takes a set and puts it back when done. */
+    private final ConcurrentLinkedQueue<Visited> spareVisited = new ConcurrentLinkedQueue<>();
 
     public HnswIndex(int dimension, Distance distance) {
         this(dimension, distance, 16, 200, 50, 42L);
@@ -222,7 +248,7 @@ public final class HnswIndex implements VectorIndex {
         List<Candidate> entryPoints = List.of(nearest);
         Node inserted = nodes.get(node);
         for (int layer = Math.min(level, entryLevel); layer >= 0; layer--) {
-            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer, false);
+            List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer, false, buildVisited);
             for (Candidate neighbour : selectNeighbours(found, maxConnections)) {
                 inserted.neighbours[layer][inserted.neighbourCount[layer]++] = neighbour.node();
                 link(neighbour.node(), node, neighbour.distance(), layer);
@@ -240,9 +266,17 @@ public final class HnswIndex implements VectorIndex {
      */
     @Override
     public List<SearchResult> search(float[] query, int k) {
+        return search(query, k, efSearch);
+    }
+
+    /** As {@link #search(float[], int)}, with a beam width for this query only. */
+    public List<SearchResult> search(float[] query, int k, int efSearch) {
         checkDimension(query);
         if (k <= 0) {
             throw new IllegalArgumentException("k must be positive: " + k);
+        }
+        if (efSearch <= 0) {
+            throw new IllegalArgumentException("efSearch must be positive: " + efSearch);
         }
         if (entryPoint < 0) {
             return List.of();
@@ -251,7 +285,16 @@ public final class HnswIndex implements VectorIndex {
         for (int layer = nodes.get(entryPoint).level(); layer > 0; layer--) {
             nearest = greedyClosest(query, nearest, layer);
         }
-        List<Candidate> found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0, true);
+        Visited visited = spareVisited.poll();
+        if (visited == null) {
+            visited = new Visited();
+        }
+        List<Candidate> found;
+        try {
+            found = searchLayer(query, List.of(nearest), Math.max(efSearch, k), 0, true, visited);
+        } finally {
+            spareVisited.offer(visited);
+        }
 
         int count = Math.min(k, found.size());
         List<SearchResult> results = new ArrayList<>(count);
@@ -273,8 +316,9 @@ public final class HnswIndex implements VectorIndex {
      * @return up to {@code ef} nodes, closest first
      */
     private List<Candidate> searchLayer(
-            float[] query, List<Candidate> entryPoints, int ef, int layer, boolean liveOnly) {
-        int epoch = nextVisitEpoch();
+            float[] query, List<Candidate> entryPoints, int ef, int layer, boolean liveOnly, Visited seen) {
+        int epoch = seen.nextEpoch(nodes.size());
+        int[] visited = seen.marks;
         PriorityQueue<Candidate> toExpand = new PriorityQueue<>(CLOSEST_FIRST);
         PriorityQueue<Candidate> best = new PriorityQueue<>(CLOSEST_FIRST.reversed());
         for (Candidate entry : entryPoints) {
@@ -520,17 +564,6 @@ public final class HnswIndex implements VectorIndex {
     int[] neighboursOf(int node, int layer) {
         Node n = nodes.get(node);
         return Arrays.copyOf(n.neighbours[layer], n.neighbourCount[layer]);
-    }
-
-    private int nextVisitEpoch() {
-        if (visited.length < nodes.size()) {
-            visited = Arrays.copyOf(visited, Math.max(visited.length * 2, nodes.size()));
-        }
-        if (visitEpoch == Integer.MAX_VALUE) {
-            Arrays.fill(visited, 0);
-            visitEpoch = 0;
-        }
-        return ++visitEpoch;
     }
 
     /** Copies {@code vector} into row {@code row} of {@link #data}, growing the array if needed. */

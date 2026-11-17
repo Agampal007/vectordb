@@ -1,5 +1,6 @@
 plugins {
     `java-library`
+    application
 }
 
 group = "io.github.agampal007"
@@ -7,6 +8,12 @@ version = "0.1.0-SNAPSHOT"
 
 repositories {
     mavenCentral()
+}
+
+// ./gradlew run --args="--port 8080 --data vectordb-data" starts the server; installDist builds
+// build/install/vectordb with a start script, which the Dockerfile uses.
+application {
+    mainClass = "io.github.agampal007.vectordb.server.Main"
 }
 
 dependencies {
@@ -47,6 +54,15 @@ tasks.register<JavaExec>("durability") {
     group = "verification"
     classpath = sourceSets["test"].runtimeClasspath
     mainClass = "io.github.agampal007.vectordb.DurabilityBenchmark"
+    maxHeapSize = "4g"
+    args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
+}
+
+tasks.register<JavaExec>("concurrency") {
+    description = "Search throughput by thread count, with a writer, and over HTTP (run scripts/download_sift.sh first)."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.server.ConcurrencyBenchmark"
     maxHeapSize = "4g"
     args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
 }
