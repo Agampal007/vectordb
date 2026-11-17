@@ -83,10 +83,9 @@ public final class ConcurrencyBenchmark {
             System.out.printf("%d logical processors, %.0f s per measurement after %.0f s of warm-up%n%n",
                     cores, MEASURE_NANOS / 1e9, WARM_UP_NANOS / 1e9);
 
-            System.out.println("| Search threads | Searches/s, no writer | Speed-up | Searches/s, one writer"
+            System.out.println("| Search threads | Searches/s, no writer | Per thread | Searches/s, one writer"
                     + " | Writes/s (fsync each) |");
             System.out.println("| --- | --- | --- | --- | --- |");
-            double single = 0;
             int copy = 0;
             for (int threads : threadCounts) {
                 Run readOnly;
@@ -101,26 +100,26 @@ public final class ConcurrencyBenchmark {
                         DurableIndex.open(directory.resolve(COLLECTION), empty, SyncPolicy.MANUAL)) {
                     withWriter = measure(threads, searcher(index, queries), writer(index, all, n));
                 }
-                if (threads == 1) {
-                    single = readOnly.searchesPerSecond();
-                }
-                System.out.printf("| %d | %,.0f | %.1fx | %,.0f | %,.0f |%n",
+                System.out.printf("| %d | %,.0f | %,.0f | %,.0f | %,.0f |%n",
                         threads,
                         readOnly.searchesPerSecond(),
-                        readOnly.searchesPerSecond() / single,
+                        readOnly.searchesPerSecond() / threads,
                         withWriter.searchesPerSecond(),
                         withWriter.writesPerSecond());
             }
 
             System.out.println();
-            System.out.println("Through the HTTP API on localhost (JSON in and out, one connection per client):");
+            System.out.println("Through the HTTP API on localhost (JSON in and out, one connection per client).");
+            System.out.println("GET /health does no work, so it shows what the HTTP layer alone costs:");
             System.out.println();
-            System.out.println("| Clients | Searches/s | Median latency | 99th percentile |");
-            System.out.println("| --- | --- | --- | --- |");
+            System.out.println("| Request | Clients | Requests/s | Median latency | 99th percentile |");
+            System.out.println("| --- | --- | --- | --- | --- |");
             Path directory = copyOf(template, work.resolve("run" + copy));
             try (VectorDbServer server = VectorDbServer.start(directory, "127.0.0.1", 0, Options.defaults());
                     HttpClient client = HttpClient.newBuilder().version(HttpClient.Version.HTTP_1_1).build()) {
-                URI uri = URI.create("http://127.0.0.1:" + server.port() + "/collections/" + COLLECTION + "/search");
+                String base = "http://127.0.0.1:" + server.port();
+                URI health = URI.create(base + "/health");
+                URI search = URI.create(base + "/collections/" + COLLECTION + "/search");
                 String[] bodies = new String[queries.length];
                 for (int i = 0; i < queries.length; i++) {
                     Map<String, Object> body = new LinkedHashMap<>();
@@ -128,17 +127,12 @@ public final class ConcurrencyBenchmark {
                     body.put("k", (long) K);
                     bodies[i] = Json.write(body);
                 }
-                for (int clients : new int[] {1, 8}) {
+                for (int clients : new int[] {1, 8, 24}) {
                     if (clients > cores) {
                         continue;
                     }
-                    Run run = measure(clients, httpSearcher(client, uri, bodies), null);
-                    long[] latencies = run.latenciesNanos();
-                    System.out.printf("| %d | %,.0f | %.2f ms | %.2f ms |%n",
-                            clients,
-                            run.searchesPerSecond(),
-                            latencies[latencies.length / 2] / 1e6,
-                            latencies[(int) (latencies.length * 0.99)] / 1e6);
+                    printHttpRow("GET /health", clients, measure(clients, httpRequest(client, health, null), null));
+                    printHttpRow("POST search", clients, measure(clients, httpRequest(client, search, bodies), null));
                 }
             }
         } finally {
@@ -169,16 +163,28 @@ public final class ConcurrencyBenchmark {
         };
     }
 
-    private static Operation httpSearcher(HttpClient client, URI uri, String[] bodies) {
+    /** A GET when {@code bodies} is null, otherwise a POST of each body in turn. */
+    private static Operation httpRequest(HttpClient client, URI uri, String[] bodies) {
         return step -> {
-            HttpRequest request = HttpRequest.newBuilder(uri)
-                    .POST(BodyPublishers.ofString(bodies[step % bodies.length]))
-                    .build();
-            int status = client.send(request, BodyHandlers.ofString()).statusCode();
+            HttpRequest.Builder request = HttpRequest.newBuilder(uri);
+            if (bodies != null) {
+                request.POST(BodyPublishers.ofString(bodies[step % bodies.length]));
+            }
+            int status = client.send(request.build(), BodyHandlers.ofString()).statusCode();
             if (status != 200) {
-                throw new IllegalStateException("search answered " + status);
+                throw new IllegalStateException(uri + " answered " + status);
             }
         };
+    }
+
+    private static void printHttpRow(String request, int clients, Run run) {
+        long[] latencies = run.latenciesNanos();
+        System.out.printf("| %s | %d | %,.0f | %.2f ms | %.2f ms |%n",
+                request,
+                clients,
+                run.searchesPerSecond(),
+                latencies[latencies.length / 2] / 1e6,
+                latencies[(int) (latencies.length * 0.99)] / 1e6);
     }
 
     /**
