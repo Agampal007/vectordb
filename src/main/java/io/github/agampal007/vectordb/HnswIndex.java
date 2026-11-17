@@ -34,10 +34,15 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  * through it, but it is never returned. Its memory is not reclaimed, so an index with heavy churn
  * should be rebuilt.
  *
+ * <p>An insert has two halves. {@link #prepareAdd} does the expensive part, finding the new
+ * node's neighbours and working out their new link lists, without changing anything a search
+ * reads. {@link #commit} then makes the change, which is a handful of array copies.
+ *
  * <p>Threading: any number of threads may {@link #search} at the same time, because each search
- * borrows its own scratch space. {@link #add} and {@link #remove} need exclusive access, with no
- * search or other write running. This class does not enforce that; {@link DurableIndex} does, with
- * a read-write lock.
+ * borrows its own scratch space. Searches may also run during {@link #prepareAdd}. Only one thread
+ * may write at a time, and {@link #commit}, {@link #add} and {@link #remove} need the graph to
+ * themselves, with no search running. This class does not enforce any of that;
+ * {@link DurableIndex} does, with a writer lock and a read-write lock.
  */
 public final class HnswIndex implements VectorIndex {
 
@@ -86,6 +91,42 @@ public final class HnswIndex implements VectorIndex {
     /** A node paired with its distance to whatever is being searched for. */
     private record Candidate(int node, float distance) {}
 
+    /** The complete new link list of node {@code target} on {@code layer}. */
+    private record LinkUpdate(int target, int layer, int[] links) {}
+
+    /**
+     * An insert that has been worked out but not made: see {@link #prepareAdd} and
+     * {@link #commit}.
+     */
+    public static final class PendingAdd {
+        private final long id;
+        private final float[] vector;
+        /** The index the new node will have, which is how {@link #commit} detects a stale plan. */
+        private final int node;
+        private final int level;
+        /** The new node's links on each of its layers. */
+        private final int[][] links;
+        private final List<LinkUpdate> updates;
+        private final boolean becomesEntryPoint;
+
+        private PendingAdd(
+                long id,
+                float[] vector,
+                int node,
+                int level,
+                int[][] links,
+                List<LinkUpdate> updates,
+                boolean becomesEntryPoint) {
+            this.id = id;
+            this.vector = vector;
+            this.node = node;
+            this.level = level;
+            this.links = links;
+            this.updates = updates;
+            this.becomesEntryPoint = becomesEntryPoint;
+        }
+    }
+
     /** Closest first; ties broken by node index so builds and searches are reproducible. */
     private static final Comparator<Candidate> CLOSEST_FIRST = (a, b) -> {
         int byDistance = Float.compare(a.distance(), b.distance());
@@ -93,6 +134,9 @@ public final class HnswIndex implements VectorIndex {
     };
 
     private static final int INITIAL_CAPACITY = 16;
+    private static final int[] NO_LINKS = new int[0];
+    /** Passed where a pending node is expected and there is none. */
+    private static final int NO_NODE = -1;
     /** Floats converted per chunk when reading or writing vectors. */
     private static final int VECTOR_IO_CHUNK = 1 << 16;
     /** Far above any level the exponential distribution produces; guards against corrupt input. */
@@ -121,7 +165,7 @@ public final class HnswIndex implements VectorIndex {
     private float[] data;
     private int entryPoint = -1;
 
-    /** Scratch space for {@link #add}, which runs alone. */
+    /** Scratch space for {@link #prepareAdd}: one writer at a time, so one set is enough. */
     private final Visited buildVisited = new Visited();
     /** Spare scratch space for searches: each one takes a set and puts it back when done. */
     private final ConcurrentLinkedQueue<Visited> spareVisited = new ConcurrentLinkedQueue<>();
@@ -219,21 +263,38 @@ public final class HnswIndex implements VectorIndex {
         this.efSearch = efSearch;
     }
 
-    /** Inserts a vector (Algorithm 1). */
+    /** Inserts a vector (Algorithm 1): {@link #prepareAdd} followed by {@link #commit}. */
     @Override
     public void add(long id, float[] vector) {
         checkDimension(vector);
         if (nodeById.containsKey(id)) {
             throw new IllegalArgumentException("duplicate id: " + id);
         }
+        commit(prepareAdd(id, vector));
+    }
+
+    /**
+     * Works out an insert without making it: draws the new node's top layer, searches each layer
+     * for its neighbours, and computes the link list each of those neighbours will have once the
+     * new node is linked back to them. Nothing a search reads is changed, so searches may keep
+     * running. The result must be passed to {@link #commit} before any other write.
+     *
+     * <p>This is exact, not an approximation of what a one-step insert would do. On each layer
+     * the search looks only at that layer's links, the new node is not reachable until it is
+     * linked, and the neighbours chosen on one layer are distinct, so no step depends on a change
+     * that an earlier step would have made.
+     *
+     * <p>Does not check for a duplicate id; {@link #commit} does.
+     */
+    public PendingAdd prepareAdd(long id, float[] vector) {
+        checkDimension(vector);
         int node = nodes.size();
         int level = randomLevel();
-        storeVector(node, vector);
-        nodes.add(new Node(id, level, maxConnections, maxConnectionsLayer0));
-        nodeById.put(id, node);
+        int[][] links = new int[level + 1][];
+        Arrays.fill(links, NO_LINKS);
+        List<LinkUpdate> updates = new ArrayList<>();
         if (entryPoint < 0) {
-            entryPoint = node;
-            return;
+            return new PendingAdd(id, vector, node, level, links, updates, true);
         }
 
         // Above the new node's top layer, only the single closest node is carried down.
@@ -246,18 +307,56 @@ public final class HnswIndex implements VectorIndex {
         // From there down, search wide, link to a diverse subset, and seed the next layer with
         // everything found.
         List<Candidate> entryPoints = List.of(nearest);
-        Node inserted = nodes.get(node);
         for (int layer = Math.min(level, entryLevel); layer >= 0; layer--) {
             List<Candidate> found = searchLayer(vector, entryPoints, efConstruction, layer, false, buildVisited);
-            for (Candidate neighbour : selectNeighbours(found, maxConnections)) {
-                inserted.neighbours[layer][inserted.neighbourCount[layer]++] = neighbour.node();
-                link(neighbour.node(), node, neighbour.distance(), layer);
+            List<Candidate> selected = selectNeighbours(found, maxConnections, NO_NODE, null);
+            int[] own = new int[selected.size()];
+            for (int i = 0; i < own.length; i++) {
+                Candidate neighbour = selected.get(i);
+                own[i] = neighbour.node();
+                updates.add(new LinkUpdate(
+                        neighbour.node(),
+                        layer,
+                        linksAfterAdding(neighbour.node(), node, vector, neighbour.distance(), layer)));
             }
+            links[layer] = own;
             entryPoints = found;
         }
-        if (level > entryLevel) {
-            entryPoint = node;
+        return new PendingAdd(id, vector, node, level, links, updates, level > entryLevel);
+    }
+
+    /**
+     * Makes a prepared insert: stores the vector, adds the node with its links, and replaces the
+     * link lists of its neighbours. No search may be running.
+     *
+     * @throws IllegalStateException if a node was added since the insert was prepared
+     * @throws IllegalArgumentException if the id is present
+     */
+    public void commit(PendingAdd pending) {
+        if (pending.node != nodes.size()) {
+            throw new IllegalStateException("the graph changed after this insert was prepared");
         }
+        if (nodeById.containsKey(pending.id)) {
+            throw new IllegalArgumentException("duplicate id: " + pending.id);
+        }
+        storeVector(pending.node, pending.vector);
+        Node inserted = new Node(pending.id, pending.level, maxConnections, maxConnectionsLayer0);
+        for (int layer = 0; layer <= pending.level; layer++) {
+            setLinks(inserted, layer, pending.links[layer]);
+        }
+        nodes.add(inserted);
+        nodeById.put(pending.id, pending.node);
+        for (LinkUpdate update : pending.updates) {
+            setLinks(nodes.get(update.target()), update.layer(), update.links());
+        }
+        if (pending.becomesEntryPoint) {
+            entryPoint = pending.node;
+        }
+    }
+
+    private static void setLinks(Node node, int layer, int[] links) {
+        System.arraycopy(links, 0, node.neighbours[layer], 0, links.length);
+        node.neighbourCount[layer] = links.length;
     }
 
     /**
@@ -390,8 +489,11 @@ public final class HnswIndex implements VectorIndex {
      * graph stays connected across clusters.
      *
      * @param candidates closest to the base first, with distances measured from the base
+     * @param pendingNode a candidate that is not in the graph yet, or {@link #NO_NODE}
+     * @param pendingVector that candidate's vector
      */
-    private List<Candidate> selectNeighbours(List<Candidate> candidates, int max) {
+    private List<Candidate> selectNeighbours(
+            List<Candidate> candidates, int max, int pendingNode, float[] pendingVector) {
         List<Candidate> selected = new ArrayList<>(max);
         for (Candidate candidate : candidates) {
             if (selected.size() == max) {
@@ -399,7 +501,8 @@ public final class HnswIndex implements VectorIndex {
             }
             boolean diverse = true;
             for (Candidate kept : selected) {
-                if (distanceBetween(candidate.node(), kept.node()) < candidate.distance()) {
+                if (distanceBetween(candidate.node(), kept.node(), pendingNode, pendingVector)
+                        < candidate.distance()) {
                     diverse = false;
                     break;
                 }
@@ -412,29 +515,33 @@ public final class HnswIndex implements VectorIndex {
     }
 
     /**
-     * Adds the back-link {@code target -> newNeighbour}. When {@code target} is already at its
-     * cap, its links are re-chosen with the heuristic from the old set plus the new node.
+     * The links {@code target} will have on {@code layer} once {@code newNode} is linked back to
+     * it. With room to spare the new node is appended. At the cap, the links are chosen again
+     * with the heuristic from the old set plus the new node.
+     *
+     * @param newVector the new node's vector, which is not stored in the index yet
      */
-    private void link(int target, int newNeighbour, float distanceToTarget, int layer) {
+    private int[] linksAfterAdding(int target, int newNode, float[] newVector, float distanceToTarget, int layer) {
         Node node = nodes.get(target);
         int[] links = node.neighbours[layer];
         int count = node.neighbourCount[layer];
         if (count < links.length) {
-            links[count] = newNeighbour;
-            node.neighbourCount[layer]++;
-            return;
+            int[] appended = Arrays.copyOf(links, count + 1);
+            appended[count] = newNode;
+            return appended;
         }
         List<Candidate> candidates = new ArrayList<>(count + 1);
-        candidates.add(new Candidate(newNeighbour, distanceToTarget));
+        candidates.add(new Candidate(newNode, distanceToTarget));
         for (int i = 0; i < count; i++) {
             candidates.add(new Candidate(links[i], distanceBetween(target, links[i])));
         }
         candidates.sort(CLOSEST_FIRST);
-        List<Candidate> kept = selectNeighbours(candidates, links.length);
-        for (int i = 0; i < kept.size(); i++) {
-            links[i] = kept.get(i).node();
+        List<Candidate> kept = selectNeighbours(candidates, links.length, newNode, newVector);
+        int[] chosen = new int[kept.size()];
+        for (int i = 0; i < chosen.length; i++) {
+            chosen[i] = kept.get(i).node();
         }
-        node.neighbourCount[layer] = kept.size();
+        return chosen;
     }
 
     /**
@@ -582,6 +689,21 @@ public final class HnswIndex implements VectorIndex {
     /** Distance between the stored vectors of nodes {@code a} and {@code b}. */
     private float distanceBetween(int a, int b) {
         return distance.compute(data, a * dimension, data, b * dimension, dimension);
+    }
+
+    /**
+     * As {@link #distanceBetween(int, int)}, where {@code pendingNode} is not stored yet and
+     * {@code pendingVector} stands in for its row. The arguments keep their order, so the result
+     * is bit for bit what it would be with the vector stored.
+     */
+    private float distanceBetween(int a, int b, int pendingNode, float[] pendingVector) {
+        if (a == pendingNode) {
+            return distance.compute(pendingVector, 0, data, b * dimension, dimension);
+        }
+        if (b == pendingNode) {
+            return distance.compute(data, a * dimension, pendingVector, 0, dimension);
+        }
+        return distanceBetween(a, b);
     }
 
     private void checkDimension(float[] vector) {

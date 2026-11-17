@@ -39,12 +39,18 @@ import java.util.function.Supplier;
  *       the change in memory. Operations therefore reach the log in the order they are applied,
  *       which replay depends on.
  *   <li>The <em>graph lock</em> is a read-write lock around the in-memory index. Searches share
- *       it; a writer takes it exclusively only for the change in memory, after its log append has
- *       finished.
+ *       it; a writer takes it exclusively only to make its change, after its log append has
+ *       finished and after the insert has been worked out.
  * </ul>
  *
- * <p>So searches wait for a graph insert, but never for disk: not for a log append, not for an
- * fsync, and not for a snapshot, which only reads the index while holding the writer lock.
+ * <p>An insert spends nearly all its time finding the new vector's neighbours, which reads the
+ * graph without changing it. Only the writer lock is held for that, so searches carry on
+ * alongside; the holder of the writer lock is the only thread that can change the graph, so what
+ * it reads cannot move under it. The graph lock is then taken exclusively just to link the new
+ * node in, a handful of array copies.
+ *
+ * <p>So searches wait only for that linking step, and never for disk: not for a log append, not
+ * for an fsync, and not for a snapshot, which only reads the index while holding the writer lock.
  *
  * <p>The directory is also locked against a second opener, in this process or another; see
  * {@link DirectoryLock}.
@@ -173,9 +179,10 @@ public final class DurableIndex implements VectorIndex, Closeable {
                 throw new IllegalArgumentException("duplicate id: " + id);
             }
             append(Op.ADD, id, vector);
+            HnswIndex.PendingAdd pending = index.prepareAdd(id, vector); // searches keep running
             graphLock.writeLock().lock();
             try {
-                index.add(id, vector);
+                index.commit(pending);
             } finally {
                 graphLock.writeLock().unlock();
             }
@@ -197,10 +204,13 @@ public final class DurableIndex implements VectorIndex, Closeable {
             ensureOpen();
             checkDimension(vector);
             append(Op.ADD, id, vector);
+            // Preparing before the old vector is removed gives the same result as after: removal
+            // only marks the node, and building the graph does not look at the marks.
+            HnswIndex.PendingAdd pending = index.prepareAdd(id, vector);
             graphLock.writeLock().lock();
             try {
                 boolean replaced = index.remove(id);
-                index.add(id, vector);
+                index.commit(pending);
                 return replaced;
             } finally {
                 graphLock.writeLock().unlock();
