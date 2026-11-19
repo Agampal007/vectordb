@@ -1,0 +1,21 @@
+SIFT, 128 dimensions, M = 16, efConstruction = 200; all servers in one JVM on localhost
+
+Part 1: 2,000 single-vector writes, one at a time, after 1,000 untimed; fsync per request
+
+| Setup | Writes/s | Median latency | 99th percentile |
+| --- | --- | --- | --- |
+| no followers | 252 | 3.56 ms | 8.17 ms |
+| 1 follower, leader does not wait | 318 | 3.13 ms | 5.08 ms |
+| 1 follower, leader waits for it | 119 | 7.66 ms | 16.63 ms |
+| 2 followers, leader waits for 1 | 143 | 6.84 ms | 9.52 ms |
+| 2 followers, leader waits for both | 129 | 7.42 ms | 12.70 ms |
+
+Part 2: a new follower copies a collection of 100,000 vectors
+
+| Step | Time | Notes |
+| --- | --- | --- |
+| Load the leader through the API | 74.6 s | batches of 1,000 vectors |
+| New follower, copying the leader's log | 73.6 s | replays 100,000 operations, building the graph again |
+| New follower, after the leader's log was emptied by a snapshot | 0.79 s | downloads a 58 MB snapshot; 93x faster |
+
+Both followers' snapshots are byte for byte the leader's: true
