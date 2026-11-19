@@ -1,0 +1,31 @@
+# Three nodes: node1 leads, node2 and node3 follow it. Each keeps its data in its own volume, and
+# each answers a write only once one follower holds it (--min-replicas 1).
+#
+# --follow is read only the first time a node starts. After that the role is kept in the node's
+# data directory and changes only through POST /admin/promote and POST /admin/follow, so a node
+# that was promoted still leads after a restart. scripts/cluster_test.sh runs a failover.
+x-node: &node
+  build: .
+  image: vectordb
+
+services:
+  node1:
+    <<: *node
+    command: ["--min-replicas", "1"]
+    ports: ["8081:8080"]
+    volumes: ["node1:/data"]
+  node2:
+    <<: *node
+    command: ["--min-replicas", "1", "--follow", "http://node1:8080"]
+    ports: ["8082:8080"]
+    volumes: ["node2:/data"]
+  node3:
+    <<: *node
+    command: ["--min-replicas", "1", "--follow", "http://node1:8080"]
+    ports: ["8083:8080"]
+    volumes: ["node3:/data"]
+
+volumes:
+  node1:
+  node2:
+  node3:

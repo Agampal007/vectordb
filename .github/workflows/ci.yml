@@ -42,3 +42,15 @@ jobs:
       - name: Server log
         if: always()
         run: docker logs vectordb
+
+  cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Failover on a three-node cluster
+        run: |
+          docker compose up -d --build
+          scripts/cluster_test.sh
+      - name: Server logs
+        if: always()
+        run: docker compose logs
