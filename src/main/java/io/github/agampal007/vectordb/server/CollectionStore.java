@@ -195,7 +195,7 @@ public final class CollectionStore implements Closeable {
             IOException failure = null;
             for (Collection collection : collections.values()) {
                 try (DurableIndex index = collection.index()) {
-                    if (index.logSizeBytes() > EMPTY_LOG_BYTES) {
+                    if (index.hasLoggedOperations()) {
                         index.snapshot();
                     }
                 } catch (IOException e) {
@@ -213,9 +213,6 @@ public final class CollectionStore implements Closeable {
             }
         }
     }
-
-    /** A log with no records is just its 8-byte header. */
-    private static final long EMPTY_LOG_BYTES = 8;
 
     private void ensureOpen() {
         if (closed) {

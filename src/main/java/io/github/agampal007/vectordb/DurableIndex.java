@@ -7,9 +7,15 @@ import io.github.agampal007.vectordb.wal.WriteAheadLog.SyncPolicy;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.UncheckedIOException;
+import java.nio.channels.FileChannel;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.util.List;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.locks.Condition;
 import java.util.concurrent.locks.ReentrantLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.function.Supplier;
@@ -54,6 +60,18 @@ import java.util.function.Supplier;
  *
  * <p>The directory is also locked against a second opener, in this process or another; see
  * {@link DirectoryLock}.
+ *
+ * <h2>Replication</h2>
+ *
+ * <p>Each logged operation carries a term: the {@link #setTerm term} this index was given when the
+ * operation was written here, or the leader's term for an operation copied from a leader. A
+ * leader serves its records with {@link #readLogAfter}, but only to a follower whose last
+ * operation is at a sequence number this log holds with the same term, and only once they are
+ * forced to the device. A follower appends them with {@link #applyReplicated}, keeping their
+ * sequence numbers and terms, and applies them through the same code as recovery, so its graph is
+ * the leader's, link for link. A follower whose log does not continue into the leader's starts
+ * again from a snapshot: {@link #writeTransferSnapshot} on the leader, {@link #installSnapshot}
+ * on the follower.
  */
 public final class DurableIndex implements VectorIndex, Closeable {
 
@@ -66,9 +84,23 @@ public final class DurableIndex implements VectorIndex, Closeable {
             long truncatedBytes,
             boolean unfinishedSnapshotDiscarded) {}
 
+    /** A point in a log: a sequence number and the term of the operation there. */
+    public record Position(long sequence, long term) {
+
+        /** Whether this log is further ahead: a later term, or the same term and a later operation. */
+        public boolean isAheadOf(Position other) {
+            return term != other.term ? term > other.term : sequence > other.sequence;
+        }
+    }
+
+    /** A snapshot written for a follower to download; the caller deletes the file when done. */
+    public record Transfer(Path file, Position position) {}
+
     static final String SNAPSHOT_FILE = "snapshot.bin";
     static final String SNAPSHOT_TEMPORARY = "snapshot.tmp";
     static final String LOG_FILE = "wal.log";
+    /** Prefix of snapshots being sent or received; any left behind by a crash are deleted on open. */
+    public static final String TRANSFER_PREFIX = "transfer-";
 
     private final Path directory;
     private final HnswIndex index;
@@ -78,6 +110,12 @@ public final class DurableIndex implements VectorIndex, Closeable {
     private final ReentrantLock writerLock = new ReentrantLock();
     private final ReentrantReadWriteLock graphLock = new ReentrantReadWriteLock();
     private volatile boolean closed;
+    /** The term recorded with operations written through this object. */
+    private volatile long term;
+    /** Lets a leader's request for new records wait until there are some. */
+    private final ReentrantLock syncLock = new ReentrantLock();
+    private final Condition synced = syncLock.newCondition();
+    private volatile long syncedSequence;
 
     private DurableIndex(
             Path directory, HnswIndex index, WriteAheadLog log, Recovery recovery, DirectoryLock directoryLock) {
@@ -86,6 +124,8 @@ public final class DurableIndex implements VectorIndex, Closeable {
         this.log = log;
         this.recovery = recovery;
         this.directoryLock = directoryLock;
+        this.term = log.lastTerm();
+        this.syncedSequence = log.syncedSequence();
     }
 
     /**
@@ -114,6 +154,7 @@ public final class DurableIndex implements VectorIndex, Closeable {
     private static DurableIndex open(
             Path directory, Supplier<HnswIndex> emptyIndex, SyncPolicy policy, DirectoryLock directoryLock)
             throws IOException {
+        deleteTransfers(directory);
         // A snapshot that was still being written when the process died was never renamed into place.
         boolean unfinishedSnapshot = Files.deleteIfExists(directory.resolve(SNAPSHOT_TEMPORARY));
 
@@ -121,10 +162,12 @@ public final class DurableIndex implements VectorIndex, Closeable {
         boolean snapshotLoaded = Files.exists(snapshotPath);
         HnswIndex index;
         long snapshotSequence = 0;
+        long snapshotTerm = 0;
         if (snapshotLoaded) {
             Snapshot snapshot = Snapshot.read(snapshotPath);
             index = snapshot.index;
             snapshotSequence = snapshot.sequence;
+            snapshotTerm = snapshot.term;
         } else {
             index = emptyIndex.get();
         }
@@ -134,7 +177,7 @@ public final class DurableIndex implements VectorIndex, Closeable {
         long alreadyInSnapshot = snapshotSequence;
         WriteAheadLog log;
         try {
-            log = WriteAheadLog.open(directory.resolve(LOG_FILE), policy, snapshotSequence, entry -> {
+            log = WriteAheadLog.open(directory.resolve(LOG_FILE), policy, snapshotSequence, snapshotTerm, entry -> {
                 if (entry.sequence() <= alreadyInSnapshot) {
                     skipped[0]++;
                 } else {
@@ -147,7 +190,21 @@ public final class DurableIndex implements VectorIndex, Closeable {
         }
         Recovery recovery = new Recovery(
                 snapshotLoaded, snapshotSequence, replayed[0], skipped[0], log.truncatedBytes(), unfinishedSnapshot);
-        return new DurableIndex(directory, index, log, recovery, directoryLock);
+        DurableIndex durable = new DurableIndex(directory, index, log, recovery, directoryLock);
+        if (log.isOldFormat()) {
+            // A log written before terms existed cannot be appended to. Fold what it holds into a
+            // snapshot, which rewrites it in the current format.
+            try {
+                if (log.recordCount() > 0) {
+                    durable.writeSnapshot();
+                }
+                log.reset();
+            } catch (IOException | RuntimeException e) {
+                log.close();
+                throw e;
+            }
+        }
+        return durable;
     }
 
     /** Applies one logged operation. An ADD for an id that is present replaces it, as {@link #upsert} does. */
@@ -157,6 +214,14 @@ public final class DurableIndex implements VectorIndex, Closeable {
             index.add(entry.id(), entry.vector());
         } else if (!index.remove(entry.id())) {
             throw new IllegalStateException("log removes id " + entry.id() + ", which is not in the index");
+        }
+    }
+
+    private static void deleteTransfers(Path directory) throws IOException {
+        try (DirectoryStream<Path> transfers = Files.newDirectoryStream(directory, TRANSFER_PREFIX + "*")) {
+            for (Path transfer : transfers) {
+                Files.deleteIfExists(transfer);
+            }
         }
     }
 
@@ -242,10 +307,169 @@ public final class DurableIndex implements VectorIndex, Closeable {
 
     private void append(Op op, long id, float[] vector) {
         try {
-            log.append(op, id, vector);
+            log.append(term, op, id, vector);
         } catch (IOException e) {
             throw new UncheckedIOException(e);
         }
+        publishSynced();
+    }
+
+    /**
+     * Appends operations copied from a leader's log, keeping their sequence numbers and terms,
+     * applies them, and forces them to the device before returning. They must carry on from this
+     * index's last operation. Searches keep running while each insert is worked out, as they do
+     * for local writes.
+     *
+     * @throws IllegalArgumentException if the operations do not follow on from this log, or one
+     *     would fail when the log is replayed; nothing from that operation on is applied
+     */
+    public void applyReplicated(List<Entry> entries) throws IOException {
+        writerLock.lock();
+        try {
+            ensureOpen();
+            for (Entry entry : entries) {
+                if (entry.op() == Op.ADD) {
+                    checkDimension(entry.vector());
+                } else if (!index.contains(entry.id())) {
+                    throw new IllegalArgumentException("the leader removes id " + entry.id() + ", which is not here");
+                }
+                log.append(entry); // checks that it is the next sequence number and the term does not go down
+                HnswIndex.PendingAdd pending =
+                        entry.op() == Op.ADD ? index.prepareAdd(entry.id(), entry.vector()) : null;
+                graphLock.writeLock().lock();
+                try {
+                    // The same steps as replay after a crash, so the graph is the same.
+                    index.remove(entry.id());
+                    if (pending != null) {
+                        index.commit(pending);
+                    }
+                } finally {
+                    graphLock.writeLock().unlock();
+                }
+            }
+            log.sync();
+            publishSynced();
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /**
+     * The log records after a follower's last operation: whole records as stored, about
+     * {@code maxBytes} at most, and only those already forced to the device here.
+     *
+     * @return the records, possibly none yet; or null if this log cannot continue the follower's,
+     *     because the follower is ahead of it, holds a different term at that sequence number, or
+     *     is so far behind that the records it needs are now only in a snapshot. The follower must
+     *     then start again from {@link #writeTransferSnapshot}.
+     */
+    public byte[] readLogAfter(Position follower, int maxBytes) throws IOException {
+        writerLock.lock();
+        try {
+            ensureOpen();
+            if (follower.sequence() > log.lastSequence()
+                    || follower.sequence() < log.base()
+                    || log.termAt(follower.sequence()) != follower.term()) {
+                return null;
+            }
+            return log.readAfter(follower.sequence(), maxBytes);
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /**
+     * Waits until an operation after {@code sequence} is on the storage device, or the time is up.
+     *
+     * @return whether there is such an operation
+     */
+    public boolean awaitSyncedAfter(long sequence, long timeout, TimeUnit unit) throws InterruptedException {
+        long nanos = unit.toNanos(timeout);
+        syncLock.lock();
+        try {
+            while (syncedSequence <= sequence && !closed) {
+                if (nanos <= 0) {
+                    return false;
+                }
+                nanos = synced.awaitNanos(nanos);
+            }
+            return syncedSequence > sequence;
+        } finally {
+            syncLock.unlock();
+        }
+    }
+
+    private void publishSynced() {
+        long now = log.syncedSequence();
+        if (now == syncedSequence) {
+            return;
+        }
+        syncLock.lock();
+        try {
+            syncedSequence = now;
+            synced.signalAll();
+        } finally {
+            syncLock.unlock();
+        }
+    }
+
+    /**
+     * Writes the index as it is now to a new file in its directory, for a follower to download.
+     * The log is forced first, so the snapshot holds nothing that could still be lost here.
+     * Writers wait while it is written; searches do not. The caller deletes the file.
+     */
+    public Transfer writeTransferSnapshot() throws IOException {
+        writerLock.lock();
+        try {
+            ensureOpen();
+            log.sync();
+            publishSynced();
+            Path file = Files.createTempFile(directory, TRANSFER_PREFIX, ".snapshot");
+            Position position = new Position(log.lastSequence(), log.lastTerm());
+            Snapshot.write(
+                    file,
+                    file.resolveSibling(file.getFileName() + ".tmp"),
+                    index,
+                    position.sequence(),
+                    position.term());
+            return new Transfer(file, position);
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /**
+     * Replaces what a directory holds with a downloaded snapshot. The directory must not be open.
+     * The download must be in the same directory, so that it can be renamed into place.
+     *
+     * <p>The log is deleted before the snapshot is renamed into place: if the process dies between
+     * the two, the directory holds its old snapshot without the log, an earlier state that a
+     * follower simply continues from. The other order could leave the new snapshot with an old log
+     * whose later records do not belong to it.
+     *
+     * @return the position the snapshot is at
+     * @throws CorruptSnapshotException if the download fails its checksum; nothing is changed
+     */
+    public static Position installSnapshot(Path directory, Path downloaded) throws IOException {
+        Position position = Snapshot.verify(downloaded);
+        try (FileChannel channel = FileChannel.open(downloaded, StandardOpenOption.WRITE)) {
+            channel.force(true);
+        }
+        DirectoryLock lock = DirectoryLock.acquire(directory); // refuses if the directory is open
+        try {
+            Files.deleteIfExists(directory.resolve(LOG_FILE));
+            Files.deleteIfExists(directory.resolve(SNAPSHOT_TEMPORARY));
+            Snapshot.syncDirectory(directory);
+            Files.move(
+                    downloaded,
+                    directory.resolve(SNAPSHOT_FILE),
+                    StandardCopyOption.ATOMIC_MOVE,
+                    StandardCopyOption.REPLACE_EXISTING);
+            Snapshot.syncDirectory(directory);
+        } finally {
+            lock.close();
+        }
+        return position;
     }
 
     /**
@@ -258,6 +482,7 @@ public final class DurableIndex implements VectorIndex, Closeable {
             ensureOpen();
             writeSnapshot();
             log.reset();
+            publishSynced();
         } finally {
             writerLock.unlock();
         }
@@ -291,7 +516,8 @@ public final class DurableIndex implements VectorIndex, Closeable {
                     directory.resolve(SNAPSHOT_FILE),
                     directory.resolve(SNAPSHOT_TEMPORARY),
                     index,
-                    log.lastSequence());
+                    log.lastSequence(),
+                    log.lastTerm());
         } finally {
             writerLock.unlock();
         }
@@ -303,6 +529,7 @@ public final class DurableIndex implements VectorIndex, Closeable {
         try {
             ensureOpen();
             log.sync();
+            publishSynced();
         } finally {
             writerLock.unlock();
         }
@@ -317,6 +544,55 @@ public final class DurableIndex implements VectorIndex, Closeable {
         } finally {
             writerLock.unlock();
         }
+    }
+
+    /** Whether the log holds operations that are not in a snapshot yet. */
+    public boolean hasLoggedOperations() {
+        writerLock.lock();
+        try {
+            ensureOpen();
+            return log.recordCount() > 0;
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /** The sequence number and term of the last operation logged here. */
+    public Position lastPosition() {
+        writerLock.lock();
+        try {
+            ensureOpen();
+            return new Position(log.lastSequence(), log.lastTerm());
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    /**
+     * Sets the term recorded with operations written from now on through {@link #add},
+     * {@link #upsert} and {@link #remove}.
+     *
+     * @throws IllegalArgumentException if it is below the term of the last logged operation
+     */
+    public void setTerm(long term) {
+        writerLock.lock();
+        try {
+            if (term < log.lastTerm()) {
+                throw new IllegalArgumentException(
+                        "term " + term + " is below the term of the last logged operation, " + log.lastTerm());
+            }
+            this.term = term;
+        } finally {
+            writerLock.unlock();
+        }
+    }
+
+    public long term() {
+        return term;
+    }
+
+    public Path directory() {
+        return directory;
     }
 
     public Recovery recovery() {
@@ -404,6 +680,12 @@ public final class DurableIndex implements VectorIndex, Closeable {
                 closed = true;
             } finally {
                 graphLock.writeLock().unlock();
+            }
+            syncLock.lock();
+            try {
+                synced.signalAll(); // waiters see the index is closed
+            } finally {
+                syncLock.unlock();
             }
             try {
                 log.close();
