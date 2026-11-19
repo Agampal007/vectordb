@@ -78,8 +78,9 @@ post "$n3/admin/follow" '{"leader": "http://node2:8080"}' > /dev/null
 echo "node3 now follows node2"
 
 for id in $(seq 0 299); do
-    vector=$(curl -sf "$n2/collections/demo/vectors/$id" | jq -c .vector) || fail "answered write $id is missing on node2"
-    [ "$vector" = "[$id,1,0,0]" ] || fail "id $id holds $vector on node2"
+    stored=$(curl -sf "$n2/collections/demo/vectors/$id") || fail "answered write $id is missing on node2"
+    # Compared as numbers: the server writes 1.0, and jq versions differ in whether they print it as 1.
+    echo "$stored" | jq -e --argjson id "$id" '.vector == [$id, 1, 0, 0]' > /dev/null         || fail "id $id holds $(echo "$stored" | jq -c .vector) on node2"
 done
 echo "all 300 answered writes are on node2"
 
