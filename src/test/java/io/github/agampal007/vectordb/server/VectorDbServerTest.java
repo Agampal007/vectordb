@@ -286,7 +286,7 @@ class VectorDbServerTest {
         assertEquals(0L, send("GET", "/collections/c", null).get("size"));
         assertEquals(1, ((List<?>) send("GET", "/collections", null).get("collections")).size());
         try (var children = Files.list(data)) {
-            assertEquals(List.of("LOCK", "c"), children.map(path -> path.getFileName().toString()).sorted().toList());
+            assertEquals(List.of("LOCK", "c", "node.properties"), children.map(path -> path.getFileName().toString()).sorted().toList());
         }
     }
 

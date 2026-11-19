@@ -38,10 +38,12 @@ import java.util.concurrent.Executors;
  * POST   /collections/{name}/snapshot
  * </pre>
  *
+ * <p>plus the replication and failover endpoints described in {@link Replication}.
+ *
  * <p>A write is answered only after it is in the log and, with {@link SyncMode#REQUEST}, after one
- * fsync covering the whole request. There is no authentication and no TLS: the server is meant to
- * sit behind something that provides both, and listens on the loopback address unless told
- * otherwise.
+ * fsync covering the whole request; on a leader with {@code minReplicas} set, only after that many
+ * followers hold it too. There is no authentication and no TLS: the server is meant to sit behind
+ * something that provides both, and listens on the loopback address unless told otherwise.
  */
 public final class VectorDbServer implements Closeable {
 
@@ -56,58 +58,86 @@ public final class VectorDbServer implements Closeable {
     /**
      * @param snapshotLogBytes a collection is snapshotted when its log grows past this
      * @param maxBodyBytes larger request bodies are refused with 413
+     * @param minReplicas on a leader, how many followers must hold a write before it is answered
+     * @param replicationTimeoutMillis how long a leader waits for them before answering 503
+     * @param follow for a new data directory, the leader to follow; null to lead. An existing data
+     *     directory keeps the role it has.
      */
-    public record Options(SyncMode sync, long snapshotLogBytes, int maxBodyBytes) {
+    public record Options(
+            SyncMode sync,
+            long snapshotLogBytes,
+            int maxBodyBytes,
+            int minReplicas,
+            long replicationTimeoutMillis,
+            String follow) {
+
+        public Options {
+            if (minReplicas < 0) {
+                throw new IllegalArgumentException("minReplicas must not be negative: " + minReplicas);
+            }
+            if (replicationTimeoutMillis < 1) {
+                throw new IllegalArgumentException("the replication timeout must be positive");
+            }
+            if (follow != null) {
+                follow = Replication.baseUrl(follow, "follow");
+            }
+        }
+
+        /** A node on its own: no replicas, and it leads. */
+        public Options(SyncMode sync, long snapshotLogBytes, int maxBodyBytes) {
+            this(sync, snapshotLogBytes, maxBodyBytes, 0, 5_000, null);
+        }
 
         public static Options defaults() {
             return new Options(SyncMode.REQUEST, 64L << 20, 32 << 20);
         }
-    }
 
-    /** A request that cannot be served, with the HTTP status to answer it with. */
-    private static final class ApiException extends RuntimeException {
-
-        private static final long serialVersionUID = 1L;
-
-        final int status;
-
-        ApiException(int status, String message) {
-            super(message);
-            this.status = status;
+        public Options withReplication(int minReplicas, long replicationTimeoutMillis, String follow) {
+            return new Options(sync, snapshotLogBytes, maxBodyBytes, minReplicas, replicationTimeoutMillis, follow);
         }
     }
+
+    /** Returned by a handler that has already sent its response. */
+    static final Object RESPONDED = new Object();
 
     private static final int MAX_K = 10_000;
 
     private final CollectionStore store;
     private final Options options;
+    private final Replication replication;
     private final HttpServer http;
     private final ExecutorService executor;
 
-    private VectorDbServer(CollectionStore store, Options options, HttpServer http, ExecutorService executor) {
+    private VectorDbServer(
+            CollectionStore store, Options options, Replication replication, HttpServer http, ExecutorService executor) {
         this.store = store;
         this.options = options;
+        this.replication = replication;
         this.http = http;
         this.executor = executor;
     }
 
     /**
-     * Opens the data directory, replays its logs and starts listening.
+     * Opens the data directory, replays its logs, starts listening and, on a follower, starts
+     * following.
      *
      * @param port 0 picks a free port; see {@link #port()}
      */
     public static VectorDbServer start(Path dataDirectory, String host, int port, Options options)
             throws IOException {
-        CollectionStore store = CollectionStore.open(dataDirectory);
+        CollectionStore store = CollectionStore.open(dataDirectory, options.follow());
+        Replication replication = new Replication(store, options);
         try {
             HttpServer http = HttpServer.create(new InetSocketAddress(host, port), 0);
             ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor();
-            VectorDbServer server = new VectorDbServer(store, options, http, executor);
+            VectorDbServer server = new VectorDbServer(store, options, replication, http, executor);
             http.setExecutor(executor);
             http.createContext("/", server::handle);
             http.start();
+            replication.start();
             return server;
         } catch (IOException | RuntimeException e) {
+            replication.close();
             store.close();
             throw e;
         }
@@ -117,9 +147,21 @@ public final class VectorDbServer implements Closeable {
         return http.getAddress().getPort();
     }
 
-    /** Stops accepting requests, lets running ones finish, snapshots and closes every collection. */
+    /** This node's role and term, for logging. */
+    public String describeRole() {
+        NodeState node = store.node();
+        return node.role() == NodeState.Role.LEADER
+                ? "leader in term " + node.term()
+                : "follower of " + node.leader() + " in term " + node.term();
+    }
+
+    /**
+     * Stops following, stops accepting requests, lets running ones finish, snapshots and closes
+     * every collection.
+     */
     @Override
     public void close() throws IOException {
+        replication.close();
         http.stop(1);
         executor.shutdown();
         store.close();
@@ -130,6 +172,9 @@ public final class VectorDbServer implements Closeable {
         Object body;
         try {
             body = route(exchange);
+            if (body == RESPONDED) {
+                return;
+            }
             status = "PUT".equals(exchange.getRequestMethod()) ? 201 : 200;
         } catch (ApiException e) {
             status = e.status;
@@ -163,6 +208,13 @@ public final class VectorDbServer implements Closeable {
             requireMethod(method, "GET");
             return Map.of("status", "ok");
         }
+        if (parts.length >= 2 && parts[1].equals("replication")) {
+            return replication.replicationRequest(exchange, parts);
+        }
+        if (parts.length == 3 && parts[1].equals("admin")) {
+            requireMethod(method, "POST");
+            return replication.adminRequest(parts[2], readObject(exchange));
+        }
         if (parts.length < 2 || !parts[1].equals("collections") || parts.length > 5) {
             throw new ApiException(404, "no such path: " + path);
         }
@@ -180,12 +232,19 @@ public final class VectorDbServer implements Closeable {
         }
         if (parts.length == 3) {
             return switch (method) {
-                case "PUT" -> create(name, readObject(exchange));
+                case "PUT" -> {
+                    replication.checkWritable();
+                    Object created = create(name, readObject(exchange));
+                    replication.catalogChanged();
+                    yield created;
+                }
                 case "GET" -> describe(existing(name));
                 case "DELETE" -> {
+                    replication.checkWritable();
                     if (!store.drop(name)) {
                         throw noCollection(name);
                     }
+                    replication.catalogChanged();
                     yield Map.of("dropped", true);
                 }
                 default -> throw methodNotAllowed(method);
@@ -195,7 +254,10 @@ public final class VectorDbServer implements Closeable {
         if (parts.length == 4) {
             requireMethod(method, "POST");
             return switch (resource) {
-                case "vectors" -> upsert(existing(name), readObject(exchange));
+                case "vectors" -> {
+                    replication.checkWritable();
+                    yield upsert(existing(name), readObject(exchange));
+                }
                 case "search" -> search(existing(name), readObject(exchange));
                 case "snapshot" -> {
                     existing(name).index().snapshot();
@@ -221,7 +283,10 @@ public final class VectorDbServer implements Closeable {
                 }
                 yield ordered("id", id, "vector", vector);
             }
-            case "DELETE" -> remove(existing(name), id);
+            case "DELETE" -> {
+                replication.checkWritable();
+                yield remove(existing(name), id);
+            }
             default -> throw methodNotAllowed(method);
         };
     }
@@ -266,6 +331,7 @@ public final class VectorDbServer implements Closeable {
             }
         }
         finishWrite(index);
+        replication.awaitReplicas(collection, index.lastPosition().sequence());
         return ordered("upserted", ids.length, "replaced", replaced);
     }
 
@@ -275,6 +341,7 @@ public final class VectorDbServer implements Closeable {
             throw new ApiException(404, "no vector with id " + id);
         }
         finishWrite(index);
+        replication.awaitReplicas(collection, index.lastPosition().sequence());
         return Map.of("removed", true);
     }
 

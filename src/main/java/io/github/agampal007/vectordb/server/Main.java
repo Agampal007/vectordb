@@ -16,6 +16,9 @@ import java.util.Locale;
  * --sync request|none   fsync once per write request, or leave it to the operating system
  * --snapshot-log-mb N   snapshot a collection when its log passes N MB (default 64)
  * --max-body-mb N       largest request body accepted (default 32)
+ * --follow URL          for a new data directory: follow this leader instead of leading
+ * --min-replicas N      as leader, answer a write only once N followers hold it (default 0)
+ * --replication-timeout-ms N   how long to wait for them before answering 503 (default 5000)
  * </pre>
  */
 public final class Main {
@@ -30,6 +33,10 @@ public final class Main {
         SyncMode sync = defaults.sync();
         long snapshotLogBytes = defaults.snapshotLogBytes();
         int maxBodyBytes = defaults.maxBodyBytes();
+        int minReplicas = defaults.minReplicas();
+        long replicationTimeoutMillis = defaults.replicationTimeoutMillis();
+        String follow = null;
+        Options options;
         try {
             if (args.length % 2 != 0) {
                 throw new IllegalArgumentException("every option takes a value");
@@ -43,20 +50,25 @@ public final class Main {
                     case "--sync" -> sync = SyncMode.valueOf(value.toUpperCase(Locale.ROOT));
                     case "--snapshot-log-mb" -> snapshotLogBytes = megabytes(value);
                     case "--max-body-mb" -> maxBodyBytes = Math.toIntExact(megabytes(value));
+                    case "--follow" -> follow = value;
+                    case "--min-replicas" -> minReplicas = Integer.parseInt(value);
+                    case "--replication-timeout-ms" -> replicationTimeoutMillis = Long.parseLong(value);
                     default -> throw new IllegalArgumentException("unknown option " + args[i]);
                 }
             }
+            options = new Options(sync, snapshotLogBytes, maxBodyBytes, minReplicas, replicationTimeoutMillis, follow);
         } catch (IllegalArgumentException | ArithmeticException e) {
             System.err.println("vectordb: " + e.getMessage());
             System.err.println("options: --data DIR --host HOST --port PORT --sync request|none"
-                    + " --snapshot-log-mb N --max-body-mb N");
+                    + " --snapshot-log-mb N --max-body-mb N --follow URL --min-replicas N"
+                    + " --replication-timeout-ms N");
             System.exit(2);
             return;
         }
 
         VectorDbServer server;
         try {
-            server = VectorDbServer.start(data, host, port, new Options(sync, snapshotLogBytes, maxBodyBytes));
+            server = VectorDbServer.start(data, host, port, options);
         } catch (IOException e) {
             // A locked directory, a corrupt log, a port in use: say which, without a stack trace.
             System.err.println("vectordb: cannot start: " + e.getMessage());
@@ -72,7 +84,8 @@ public final class Main {
             }
         }, "vectordb-shutdown"));
         System.out.println("vectordb listening on http://" + host + ":" + server.port()
-                + ", data in " + data.toAbsolutePath() + ", sync=" + sync.name().toLowerCase(Locale.ROOT));
+                + ", data in " + data.toAbsolutePath() + ", sync=" + sync.name().toLowerCase(Locale.ROOT)
+                + ", " + server.describeRole());
     }
 
     private static long megabytes(String value) {
