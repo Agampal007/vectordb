@@ -8,12 +8,13 @@ It exists to answer, with numbers, the questions a production vector store has t
 how much recall do you give up for how much speed, what survives a crash, and what happens to
 writes when a node dies.
 
-> **Status:** milestones 1-5 of 6 done. On SIFT-1M (1,000,000 vectors) the HNSW index reaches
+> **Status:** all 6 milestones done. On SIFT-1M (1,000,000 vectors) the HNSW index reaches
 > recall@10 of 0.975 at 169x the speed of exact search, and 0.993 at 92x, on a single thread.
 > Writes are logged before they are applied and survive killing the process; recovery from a
 > snapshot is 368x faster than replaying the log. It runs as an HTTP service, in Docker, with
 > searches on every core (51,000 to 71,000 a second on 24 threads over 100,000 vectors) that keep
-> most of their speed while a writer runs. Replication is next.
+> most of their speed while a writer runs. Followers copy the leader's log and can be promoted by
+> hand: a test kills the leader three times over and loses none of the writes it answered.
 > Benchmark numbers below come only from real runs.
 
 ## Build
@@ -28,7 +29,9 @@ scripts/download_sift.sh   # SIFT-1M into data/sift (160 MB download)
 ./gradlew sift             # SIFT-1M benchmark, about 15 minutes; -Pn=100000 for a quick subset
 ./gradlew durability       # cost of logging and speed of recovery on 100,000 SIFT vectors
 ./gradlew concurrency      # search throughput by thread count, with a writer, and over HTTP
+./gradlew replication      # cost of replication, and a new follower catching up
 ./gradlew run --args="--port 8080 --data vectordb-data"   # start the server
+docker compose up -d --build && scripts/cluster_test.sh   # three-node cluster and a failover
 ```
 
 ## Design
@@ -43,7 +46,7 @@ scripts/download_sift.sh   # SIFT-1M into data/sift (160 MB download)
 | Durability | Append-only WAL with a CRC32 and sequence number per record; snapshots written to a temporary file and renamed | No acknowledged write is lost in a crash, and recovery does not have to rebuild the graph from scratch |
 | Concurrency | One writer at a time; a read-write lock around the graph, taken exclusively only to link a new node in | Searches run on every core and never wait for a log write, an fsync, a snapshot, or the search an insert does for its neighbours |
 | Service | HTTP and JSON on the JDK's built-in server, a virtual thread per request, no dependencies | Anything can call it with `curl`; nothing to audit but this repository |
-| Replication (M6) | WAL shipping from leader to followers | Simple, testable; Raft is the stretch goal |
+| Replication | Followers pull the leader's log records byte for byte; each record carries the term it was written in; failover is a manual promotion | The graph is deterministic, so a follower that replays the same records has the leader's graph, link for link. Raft is the stretch goal |
 
 ## Milestones
 
@@ -54,7 +57,7 @@ scripts/download_sift.sh   # SIFT-1M into data/sift (160 MB download)
 | 3 | 4 | **Benchmarks.** Load SIFT-1M (`.fvecs`/`.ivecs`), recall-vs-QPS curve across `efSearch`, latency, build time and memory | ✅ SIFT-1M table and plot below. GloVe-100 and JMH distance kernels moved to the stretch goals |
 | 4 | 5 | **Durability.** WAL (append, fsync policy, CRC), snapshot + replay, deletes via tombstones | ✅ `KillRecoveryTest` kills a writer process 16 times and recovers every acknowledged write. Power loss is not tested |
 | 5 | 6 | **Service.** HTTP API (collections, upsert, search, delete), read–write locking, directory lock, Dockerfile | ✅ `docker run` and `curl` example below; CI builds the image, stops it, kills it and checks the data each time; `ConcurrencyTest` runs readers, a writer and snapshots together |
-| 6 | 7–8 | **Replication.** Leader ships WAL to followers, follower catch-up, manual failover; Docker Compose cluster | Failure test: kill the leader, promote a follower, no acknowledged write lost |
+| 6 | 7–8 | **Replication.** Leader ships WAL to followers, follower catch-up, manual failover; Docker Compose cluster | ✅ `KillLeaderTest` kills the leader process three rounds running, promotes the follower that is behind, and finds every answered write on it. CI runs the same failover on a Docker Compose cluster |
 
 Stretch: SIMD distance kernels with the Java Vector API (benchmarked with JMH), multi-threaded
 builds, group commit for the log,
@@ -76,7 +79,8 @@ try (DurableIndex index = DurableIndex.open(dir, () -> new HnswIndex(128, Distan
 ```
 
 - **Write-ahead log.** Every add, upsert and remove is appended to `wal.log` before it is applied in
-  memory. A record is its length, a CRC32, a sequence number and the operation. With
+  memory. A record is its length, a CRC32, a sequence number, a term (see Replication) and the
+  operation. With
   `EVERY_WRITE` each record is fsynced before the call returns; with `MANUAL` the caller decides
   when to sync.
 - **Snapshots.** `snapshot()` writes the whole index to a temporary file, fsyncs it, renames it
@@ -85,8 +89,8 @@ try (DurableIndex index = DurableIndex.open(dir, () -> new HnswIndex(128, Distan
   records with a higher sequence number.
 - **Deterministic replay.** Replay runs the same code as the original calls, and the snapshot
   stores the state of the generator that assigns graph levels. A recovered index is therefore the
-  same graph, link for link, as one that never stopped. The tests check this directly, and it is
-  what replication (milestone 6) will rely on.
+  same graph, link for link, as one that never stopped. The tests check this directly, and
+  replication relies on it.
 
 What recovery does in each failure case, and the test that covers it:
 
@@ -332,7 +336,171 @@ the baseline:
 - **The request that crosses the log limit pays for the snapshot** (0.11 s at 100,000 vectors),
   and other writers wait for it. Searches do not.
 - **Vectors only.** No metadata, no filtering, no paging through a collection.
-- **One node.** Replication is milestone 6.
+
+## Replication
+
+A cluster is one leader and any number of followers. Writes go to the leader; any node answers
+searches. `docker-compose.yml` starts three nodes, `node1` leading:
+
+```bash
+docker compose up -d --build
+curl -X PUT localhost:8081/collections/demo -d '{"dimension": 4}'
+curl -X POST localhost:8081/collections/demo/vectors -d '{"vectors": [{"id": 1, "vector": [1, 0, 0, 0]}]}'
+curl localhost:8082/collections/demo/vectors/1     # already on node2 or node3, see below
+curl localhost:8082/replication/status             # role, term and position of each collection
+```
+
+A node started with `--follow http://leader:8080` follows that leader. With `--min-replicas N`,
+the leader answers a write only once N followers hold it on their own storage device, and answers
+503 if they do not within `--replication-timeout-ms` (5 seconds by default). The write is then on
+the leader and maybe on some followers: it may or may not survive a failover.
+
+### Failover, by hand
+
+There is no election. When the leader dies, an operator promotes a follower, naming the others as
+its peers, and points the rest at it:
+
+```bash
+curl -X POST localhost:8082/admin/promote -d '{"peers": ["http://node3:8080"]}'
+curl -X POST localhost:8083/admin/follow  -d '{"leader": "http://node2:8080"}'
+# when node1 comes back:
+curl -X POST localhost:8081/admin/follow  -d '{"leader": "http://node2:8080"}'
+```
+
+`scripts/cluster_test.sh` does exactly this on the Compose cluster, and CI runs it.
+
+### How it works
+
+- **Followers pull.** Each follower keeps one request open to the leader for the collection list,
+  and one per collection for its log. The leader holds a request open until it has something new
+  (long polling), then sends the next log records byte for byte, as they are stored, with their
+  checksums. The follower appends them to its own log, keeping their sequence numbers, applies them
+  through the same code as recovery, forces them to its device, and asks for what comes next.
+- **Asking is acknowledging.** A follower asks for the records after position *p* only once
+  everything up to *p* is on its own device. So the leader learns from each request how far that
+  follower has got, and a write waiting for `--min-replicas` is released by the followers' next
+  requests. There is no separate acknowledgement message.
+- **Only durable records are sent.** The leader sends a record only after it has forced it to its
+  own device. Otherwise a follower could hold an operation that the leader loses in a power cut,
+  and the two logs would hold different operations under the same number.
+- **Terms.** Every log record carries the term it was written in, the term of the node that
+  accepted the write. Each promotion starts a new, higher term. Before sending anything, the leader
+  checks that it holds the follower's last record, with the same term. If the follower is ahead of
+  it, holds a different term at that number, or is so far behind that the records it needs are now
+  only in a snapshot, the leader answers 410, and the follower downloads a snapshot of the leader's
+  collection and starts again from it. This is the check Raft calls log matching, with "start again
+  from a snapshot" in place of truncating, since a node cannot be removed from an HNSW graph.
+- **Identical graphs.** The graph is deterministic: the snapshot keeps the state of the generator
+  that assigns graph levels, and replay runs the same code. A follower's collection is therefore
+  the leader's, link for link, and two nodes at the same position produce byte-identical snapshots.
+  The tests compare snapshots byte for byte instead of sampling search results.
+- **Promotion catches up first.** A write answered with `--min-replicas 1` is on at least one
+  follower, but not necessarily the one being promoted. So `promote` asks each peer for its
+  position, copies whatever is missing from the peer furthest ahead in each collection, and only
+  then accepts writes. Without this step, promoting the wrong follower loses answered writes;
+  `KillLeaderTest` checks that it fails without it.
+- **Fencing the old leader.** Promotion announces the new term to the peers, which adopt it and
+  from then on refuse anything from a node in an older term. They also send their term with every
+  request, so a restarted old leader that one of them contacts learns it has been replaced and
+  stops accepting writes (409). With `--min-replicas 1` or more it cannot answer a write anyway,
+  because no follower confirms it; its unconfirmed operations are discarded when it follows the new
+  leader, because its log no longer matches.
+- **Collections.** Creating and dropping a collection are replicated through the collection list,
+  which has a version the followers acknowledge in the same way. Each collection has an
+  incarnation id, so a collection dropped and created again under the same name is not mistaken for
+  the old one.
+- **Roles survive restarts.** A node's id, term, role and leader are kept in `node.properties` in
+  its data directory. `--follow` applies only to a new data directory, so a promoted node still
+  leads after a restart, whatever its command line says.
+
+What the tests check:
+
+| Guarantee | Test |
+| --- | --- |
+| A record copied to another log keeps its number and term; terms never go down; damaged or torn records are refused, header included | `WriteAheadLogTest` |
+| A follower that applies the leader's records has the leader's graph, link for link, and so does its own log when replayed | `ReplicatedIndexTest` |
+| The leader refuses a follower that is ahead, holds a different term at its last record, or needs records only in a snapshot; it sends only records forced to its device | `ReplicatedIndexTest` |
+| A downloaded snapshot that fails its checksum changes nothing | `ReplicatedIndexTest` |
+| With one follower and `--min-replicas 1`, every answered write is already on the follower, with byte-identical snapshots | `ReplicationTest` |
+| A leader without enough followers answers 503 but keeps the write; a follower that joins later copies it | `ReplicationTest` |
+| A follower behind a compacted log starts again from a snapshot and ends identical | `ReplicationTest` |
+| Dropping and re-creating a collection under the same name reaches the follower | `ReplicationTest` |
+| Promotion copies the writes only a peer had; the restarted old leader is fenced off and then follows, losing its unconfirmed write | `ReplicationTest` |
+| **Kill the leader process, promote the follower that is behind: no answered write is lost**, and the old leader ends byte-identical. Three rounds, each killing the current leader | `KillLeaderTest` |
+| The same failover on three Docker containers | the `cluster` job in CI, `scripts/cluster_test.sh` |
+
+`KillLeaderTest` was also run against two broken versions to check that it notices: with the
+leader not waiting for a follower, and with promotion not catching up from its peer. Both times it
+reported an answered write missing from the new leader.
+
+In each round of `KillLeaderTest`, one follower is killed first, so that the writes after it are
+confirmed by the other follower alone, and then the leader. The follower that was killed first is
+the one promoted: the worse choice, on purpose. In the three runs so far (nine rounds), between
+168 and 584 writes per round were answered after it died, and promotion copied every one of them
+from its peer.
+
+### What it costs
+
+Output of `./gradlew replication` (`results/replication-100k.txt`), SIFT vectors, all servers in
+one JVM on the same laptop as the other benchmarks, talking over localhost. One run.
+
+Single-vector writes sent one at a time, each forced to the device before it is answered:
+
+| Setup | Writes/s | Median latency | 99th percentile |
+| --- | --- | --- | --- |
+| No followers | 252 | 3.56 ms | 8.17 ms |
+| 1 follower, leader does not wait | 318 | 3.13 ms | 5.08 ms |
+| 1 follower, leader waits for it | 119 | 7.66 ms | 16.63 ms |
+| 2 followers, leader waits for 1 | 143 | 6.84 ms | 9.52 ms |
+| 2 followers, leader waits for both | 129 | 7.42 ms | 12.70 ms |
+
+- **Waiting for a follower roughly doubles the latency of a lone write**, from 3.56 ms to 7.66 ms
+  at the median. The extra is one more round trip: the follower's open request returns the record,
+  the follower appends it, forces it to its device and applies it, and its next request releases
+  the write. An HTTP exchange through the JDK's client and server already costs 1.3 to 3.6 ms on
+  this machine (see the concurrency section).
+- **The differences between the other rows are within this laptop's noise.** A follower that is not
+  waited for cannot make the leader faster, yet that row came out ahead of "no followers"; and
+  waiting for one of two followers came out slightly faster than waiting for the only one. The
+  earlier 10,000-vector run gave the same order, within 0.5 ms.
+- These are writes of one vector, one at a time. A request of many vectors waits once.
+
+A new follower copying a collection of 100,000 vectors:
+
+| Step | Time | Notes |
+| --- | --- | --- |
+| Load the leader through the API | 74.6 s | 100 requests of 1,000 vectors |
+| New follower, copying the leader's log | 73.6 s | replays 100,000 operations, building the graph again |
+| New follower, after the leader's log was emptied by a snapshot | 0.79 s | downloads a 58 MB snapshot; 93x faster |
+
+- **Copying the log costs as much as building the graph**, because the follower inserts every
+  vector again. A snapshot carries the finished graph. Both followers ended with snapshots byte for
+  byte the leader's.
+- **Loading through the API took 74.6 s, against 32.7 s for building the same graph in memory**
+  in the durability benchmark. HTTP and JSON account for some of that, and this laptop's
+  single-thread speed varies by up to two times between runs; the difference was not investigated
+  further.
+
+
+### What replication does not do
+
+- **No automatic failover.** Nothing notices that the leader is gone; an operator promotes a
+  follower. There is no election and no quorum, so two nodes promoted at the same time would both
+  lead. Raft is the stretch goal.
+- **Promotion relies on its peers being reachable.** An answered write is on at least
+  `--min-replicas` followers. If all of those are down when another follower is promoted, the write
+  is not on the new leader. A peer that cannot be reached during promotion also does not learn the
+  new term, so it could keep following a restarted old leader.
+- **`--min-replicas 0` is asynchronous.** The leader answers before any follower has the write, and
+  a write answered just before the leader dies can be lost on failover. A restarted old leader with
+  no followers can also accept writes nobody else will see.
+- **Reads on a follower can be behind** the leader by whatever has not reached it yet.
+- **A follower that falls far behind downloads a whole snapshot.** Once the leader's log has been
+  compacted past a follower's position, the leader writes a snapshot for it while holding its
+  writer lock (0.11 s at 100,000 vectors), so writes wait for that. Searches do not.
+- **Replication traffic is plain HTTP**, like the API: no authentication and no TLS between nodes.
+- **Tested on one machine and in CI.** The processes in `KillLeaderTest` and the containers in CI
+  share one host; network partitions and power loss are not tested.
 
 ## Benchmarks
 
@@ -428,13 +596,18 @@ src/main/java/io/github/agampal007/vectordb/
   Lcg.java           java.util.Random's generator with saveable state
   wal/               WriteAheadLog: checksummed records, torn-write recovery
   io/VecsFiles.java  .fvecs / .ivecs readers for ANN benchmark data
-  server/            VectorDbServer (HTTP API), CollectionStore, Json, Main
+  server/            VectorDbServer (HTTP API), CollectionStore, Json, Main;
+                     replication: Replication (endpoints, promotion), Follower, ReplicaClient,
+                     ReplicaTracker (acknowledgements), NodeState (role and term on disk)
 src/test/java/...    unit tests, KillRecoveryTest (kills a writer process), ConcurrencyTest,
+                     ReplicationTest, KillLeaderTest (kills leader processes),
                      RandomDataSweep (./gradlew sweep), SiftBenchmark (./gradlew sift),
                      DurabilityBenchmark (./gradlew durability), ConcurrencyBenchmark
-                     (./gradlew concurrency)
+                     (./gradlew concurrency), ReplicationBenchmark (./gradlew replication)
 Dockerfile           two-stage build; runs the server as an unprivileged user
-scripts/             SIFT-1M download, recall/QPS plot, smoke_test.sh (curl against a server)
+docker-compose.yml   three-node cluster
+scripts/             SIFT-1M download, recall/QPS plot, smoke_test.sh (curl against a server),
+                     cluster_test.sh (failover on the Compose cluster)
 results/, docs/      saved benchmark output and plots
 ```
 

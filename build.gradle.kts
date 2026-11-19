@@ -67,6 +67,15 @@ tasks.register<JavaExec>("concurrency") {
     args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
 }
 
+tasks.register<JavaExec>("replication") {
+    description = "Cost of replication and speed of a new follower catching up (run scripts/download_sift.sh first)."
+    group = "verification"
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass = "io.github.agampal007.vectordb.server.ReplicationBenchmark"
+    maxHeapSize = "6g"
+    args = listOf("data/sift", (findProperty("n") ?: "100000").toString())
+}
+
 tasks.test {
     useJUnitPlatform()
     // KillRecoveryTest starts a second JVM with the same classes.
